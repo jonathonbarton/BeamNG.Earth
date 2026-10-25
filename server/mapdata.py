@@ -79,7 +79,7 @@ VERSION = 2                     # pipeline version: bump when what a cell's laye
 # the "oneway" rule (Overture access_restrictions by heading)
 # roads 3: OpenStreetMap's lanes, width, sidewalk, maxspeed... joined by way id (osmtags.py)
 # roads 4: OpenStreetMap's raceways appended (osmtags.raceways, GitHub #143)
-LAYER_VERSIONS = {"roads": 4}
+LAYER_VERSIONS = {"roads": 5}   # 5: OSM name joined, same-name lane fallback (BeamMaps local branch)
                                 # (2: clipped polygon pieces `own`ed by their cell, exact cell edges,
                                 # the exact no-area test of clipped rings)
 VECTOR_LAYERS = ("roads", "connectors", "buildings", "water", "land_use", "infrastructure", "building_parts")
@@ -383,6 +383,8 @@ class MapData:
         if ways:
             feats = mapgeom.concat(feats, osmtags.raceway_features(ways))
         osmtags.join(feats, tags)
+        import oneway_joins     # one-way ends at their own lane of the two-way they meet (BeamMaps local branch)
+        oneway_joins.apply(feats)
         return feats
 
     def layer_arrays(self, key, layer, kind="demand"):

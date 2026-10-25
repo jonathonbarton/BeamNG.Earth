@@ -52,10 +52,12 @@ COLUMNS = {
     "osm_surface": "surface",
     "osm_oneway": "oneway",
     "osm_layer": "TRY_CAST(layer AS INTEGER)",
+    "osm_name": "name",
 }
-USED = {"id", "bbox", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway", "layer"}
+USED = {"id", "bbox", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway", "layer", "name"}
+FILTER_SKIP = {"id", "bbox", "name"}    # a name alone is no road tag: it rides along for join()'s same-name fallback
 FLOATS = ("lanes", "width", "maxspeed", "osm_layer")
-TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway")
+TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway", "osm_name")
 
 
 # Racetracks (GitHub #143): Overture's transportation theme has no highway=raceway (Daytona's oval and road course, the
@@ -214,7 +216,7 @@ class OsmTags:
             # only the ways with a tag the roads use (and the raceways): join() treats a way without one as one not
             # here, and building a dict per way of every highway in the cell was most of this thread's CPU
             # (osmtags, 14 CPU-s of a Deck's teleport, 2026-10-23)
-            some = " OR ".join(f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"}))
+            some = " OR ".join(f"{c} IS NOT NULL" for c in sorted(USED - FILTER_SKIP))
             rows = con.execute(f"""SELECT id, highway = 'raceway', file_row_number, {cols}
                 FROM read_parquet({uri}, file_row_number = true)
                 WHERE ({only}) AND {box} AND (highway = 'raceway' OR {some})""").fetchall()
@@ -330,4 +332,27 @@ def join(feats, tags):
     for c in TEXTS:
         feats.attrs[c if c.startswith("osm_") else "osm_" + c] = mg.text_column(
             [str(tags.get(w, {}).get(c, "")) if w is not None else "" for w in ids])
+    # same-name fallback (BeamMaps, 2026-10-25): Overture takes some segments from a route relation ("r20060942@10",
+    # US 30 on West Burnside), which has no way id, so the street's lane count (lanes=4 on 37 OSM ways) never joined
+    # and it was drawn 2 lanes. A feature with no lane count takes the commonest count of the cell's OSM ways of the
+    # same name and the same direction sense (one-way or not).
+    names = feats.attrs.get("name")
+    if names is not None and "lanes" in FLOATS:
+        by = {}
+        for t in tags.values():
+            nm, ln = str(t.get("osm_name") or "").strip().lower(), t.get("lanes")
+            if nm and ln is not None and not (isinstance(ln, float) and np.isnan(ln)):
+                one = str(t.get("osm_oneway") or "") in ("yes", "1", "-1")
+                by.setdefault((nm, one), []).append(int(ln))
+        lanes = feats.attrs["osm_lanes"]
+        oneways = feats.attrs.get("osm_oneway")
+        for i in range(n):
+            if not np.isnan(lanes[i]):
+                continue
+            nm = str(names[i] or "").strip().lower()
+            one = oneways is not None and str(oneways[i]) in ("yes", "1", "-1")
+            got = by.get((nm, one)) or by.get((nm, not one))
+            if got:
+                vals, counts = np.unique(got, return_counts=True)
+                lanes[i] = float(vals[np.argmax(counts)])
     return feats

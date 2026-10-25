@@ -540,6 +540,23 @@ def surface_kind(cls, surface):
     return "paved" if STYLE.get(cls, STYLE["unknown"])[1] else "dirt"
 
 
+# Lanes where OpenStreetMap gives none (BeamMaps, 2026-10-25): FHWA functional class through the highway tag. A two-way
+# principal or minor arterial at 35 mph (56 km/h) or more is 2 lanes and a centre turn lane (FHWA's typical suburban
+# arterial; Vancouver's NE 78th St, 72 of 103 OSM ways with no lane count, was drawn 8 m, 2 lanes); a one-way arterial
+# 2 lanes. Everything else keeps the class width.
+CLASS_LANES_KMH = 56.0
+
+
+def _class_lanes(cls, oneway, kmh):
+    if cls not in ("trunk", "primary", "secondary"):
+        return None
+    if oneway:
+        return 2
+    if kmh is not None and kmh >= CLASS_LANES_KMH:
+        return 3
+    return None
+
+
 def carriageway(cls, kind, urban, rule_width=None, oneway=False, lanes=None):
     """Paved / dirt width (m) of a road: the width rule if any, else the driving width (OpenStreetMap's lanes x the
     class's LANE_W when known, else the class's) plus parking lanes (urban paved streets; one side on a one-way street)
@@ -781,6 +798,8 @@ def _road_specs(feats, urban_fn, widths, left_hand):
             ms = _osm(feats, "maxspeed", i, 5.0, 200.0)
             if ms is not None:
                 dk = (dk[0], ms, dk[2])
+        if lanes is None and kind in BUILT and rule_w is None:
+            lanes = _class_lanes(cls, ow, dk[1])
         if urban_fn is not None and rule_w is None and kind in BUILT:
             a = feats.coord_off[feats.ring_off[feats.part_off[i]]]
             b = feats.coord_off[feats.ring_off[feats.part_off[i + 1]]]
