@@ -359,6 +359,7 @@ GIRDER_W = 0.6          # m wide each
 GIRDER_EVERY = 3.0      # m between girders across the deck
 PARAPET_W = 0.45        # m: the slab reaches this far past the road's edge, a parapet on it ...
 PARAPET_H = 0.9         # ... this high over the road
+CURB_H = 0.3            # m: the curb under an open steel railing (a table bridge's, bridgetable.railing)
 PARAPET_COVER_DZ = 2.0  # m: another deck's surface within this height at an edge point: no parapet there
 PARAPET_MIN_M = 8.0     # m: a parapet run shorter than this is left out (stubs stood in the Queensboro Bridge's lanes
                         # where its two directions' decks meet and the cover test missed a few points, 2026-10-17)
@@ -413,6 +414,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=()):
     covered = _parapet_cover([(r, c) for r, c in rb], cov_ctx)
     medians = _median_gaps([(r, c) for r, c in rb],
                            [(r, c) for r, c in zip(ribbons(list(context)), context) if r[5] is not None])
+    rails = []                                  # steel railings' beams (bridgetable.railing)
     for n, ((left, right, v, m, layer, z), c) in enumerate(rb):
         k = len(z)
         lat = left - right
@@ -459,12 +461,18 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=()):
                     sl = slice(i, j + 1)
                     zz = z[sl]
                     Eo, Ei = np.c_[edge[sl], zz] - origin, np.c_[inner[sl], zz] - origin
-                    To, Ti = Eo + [0, 0, PARAPET_H], Ei + [0, 0, PARAPET_H]
+                    rail = c.get("rail")
+                    ph = CURB_H if rail else PARAPET_H      # an open railing: a low curb with steel rails on it
+                    To, Ti = Eo + [0, 0, ph], Ei + [0, 0, ph]
+                    if rail:
+                        import bridgetable
+                        rails.extend(bridgetable.railing((edge[sl] + inner[sl]) / 2, zz + CURB_H, rail[1]))
                     o = out_l[sl] * sgn
                     quads(Eo, To, 0.0, 0.1, v[sl], v[sl], side, o)          # outside face
                     quads(Ei, Ti, 0.0, 0.1, v[sl], v[sl], side, -o)         # road face
                     quads(Ti, To, 0.0, 0.05, v[sl], v[sl], side, np.array([0.0, 0.0, 1.0]))
                 i = j + 1
+    beams = list(beams) + rails
     for p in _piers_clear(piers, rb):
         _pier(p, origin, P, T, UV, M, side)
         nv = sum(len(a) for a in P)

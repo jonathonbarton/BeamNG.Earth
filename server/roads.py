@@ -3095,6 +3095,9 @@ CHANNEL_SPANS = 3.0     # water wider than this many main spans: the clearance h
 WATER_TRESTLE_M = 3.0   # m under the deck elsewhere over such water
 
 
+RAILS = {}      # bridge part id -> (railing kind, paint) of a table bridge (bridgetable): _deck_chunks marks its chunks
+
+
 class BridgeProfiles:
     """Deck heights per bridge part for one anchor frame, each chain resolved once from all of it, so
     every tile gets the same deck (2026-10-11: computed per tile from the tile's cells, a chain's
@@ -3302,16 +3305,41 @@ class BridgeProfiles:
                 spans += sp
                 if cl is not None:
                     clear = cl if clear is None else max(clear, cl)
-            if not spans:
-                half = WATER_STEP_M / 2
-                spans = [(k, sc - half, sc + half, g + c) for k, sc, g, c in water]
-            zs = deck_profile_curve(lines, self._ground, required, spans, clear=clear, levels=levels, widths=widths)
+            # (nothing known yet: 1.6.3's own profile, never worse than it; Portland's river decks with the water rule
+            # as spans came out 79 m off in all against 1.6.3's 58, 2026-10-27)
+            if spans:
+                zs = deck_profile_curve(lines, self._ground, required, spans, clear=clear, levels=levels,
+                                        widths=widths)
         if zs is None:
             zs = deck_profile(lines, self._ground, required + water, levels=levels, widths=widths)
+        zs = self._table(comp, lines, zs)
         deficits = _clearance_deficits(lines, zs, required)
         if deficits:
             log.warning("bridge clearance below %.1f m target: %s; abutment/grade or map constraints prevent full headroom",
                         MIN_BRIDGE_HEADROOM_M, [(comp[i], round(h, 2)) for i, h in deficits[:3]])
+        return zs
+
+    def _table(self, comp, lines, zs):
+        """zs with the parts of a table bridge (bridgetable: the Interstate Bridge) on the table's profile, each kept
+        to its solved ends; their railing noted for the deck mesh (RAILS)."""
+        import bridgetable
+        try:
+            hit = bridgetable.match(self.frame, lines)
+        except Exception as ex:
+            log.debug("bridge table: %s: %s", type(ex).__name__, ex)
+            return zs
+        if not hit:
+            return zs
+        zs = list(zs)
+        by = {}
+        for k, e in hit.items():
+            by.setdefault(id(e), (e, []))[1].append(k)
+        for e, ks in by.values():
+            water = bridgetable.water_level(np.concatenate([self._ground(np.asarray(lines[k])[:, :2]) for k in ks]))
+            for k in ks:
+                z = np.asarray(zs[k], np.float64)
+                zs[k] = bridgetable.profile(self.frame, e, lines[k], water, float(z[0]), float(z[-1]))
+                RAILS[self._part_id(comp[k])] = (e.get("rail"), e.get("paint", "grey"))
         return zs
 
     LOOKUPS_PER_CHAIN = 40      # features of one chain looked up at most (the longest ones)
@@ -3443,6 +3471,21 @@ class BridgeProfiles:
         """The truss beams of a solved chain [(xy, z, width)] and the piers under its ends (bridgetypes); ([], []) for a
         plain deck."""
         import bridgetypes
+        try:
+            import bridgetable
+            lines = [np.asarray(xy, np.float64) for xy, _, _ in chain]
+            hit = bridgetable.match(self.frame, lines)
+            if hit:                             # a table bridge: its own steel (bridgetable.structure)
+                by = {}
+                for k, e in hit.items():
+                    by.setdefault(id(e), (e, []))[1].append(k)
+                beams = []
+                for e, ks in by.values():
+                    water = bridgetable.water_level(np.concatenate([self._ground(lines[k][:, :2]) for k in ks]))
+                    beams += bridgetable.structure(self.frame, e, [chain[k] for k in ks], water)
+                return beams, []
+        except Exception as ex:
+            log.debug("bridge table structure: %s: %s", type(ex).__name__, ex)
         try:
             infra = []
             if self.infra_fn is not None:
@@ -4709,6 +4752,8 @@ def _deck_chunks(decks, exact):
                         if look.get("deck"):
                             ch["deck"] = True
                             ch["fid"] = fid             # (roadmesh.deck: no parapet between parts side by side)
+                            if fid in RAILS and RAILS[fid][0]:
+                                ch["rail"] = list(RAILS[fid])   # (roadmesh.deck: an open railing, not a parapet)
                         out.append(ch)
     return out
 
