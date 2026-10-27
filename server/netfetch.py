@@ -213,6 +213,14 @@ POLICIES = {
     # MB per new area); optional: without it roads keep their width guesses
     "data.openstreetmap.us": HostPolicy(rate=4.0, burst=8.0, max_conc=2, daily_budget=5000, allow_prefetch=True,
                                         offline_ok=True, miss_ttl=None, binary=True, timeout=30.0, optional=True),
+    # the bridge lookup (bridgeinfo.py, BNE_BRIDGE_PROFILE=curve): a few small JSON answers per bridge chain, each
+    # cached on disk for good; optional (without them a deck keeps the NBI and water rules)
+    **{h: HostPolicy(rate=0.5, burst=2.0, max_conc=1, daily_budget=2000, daily_hard=4000, allow_prefetch=True,
+                     offline_ok=True, miss_ttl=None, max_wait=30.0, timeout=60.0, max_attempts=2, optional=True)
+       for h in ("www.wikidata.org", "api.openstreetmap.org")},
+    # (Overpass for the offline tools only, BNE_BRIDGE_OVERPASS=1: tools/bridge_profiles.py; one tile per query)
+    "overpass.kumi.systems": HostPolicy(rate=0.2, burst=1.0, max_conc=1, daily_budget=200, daily_hard=400,
+                                        miss_ttl=None, max_wait=60.0, timeout=120.0, max_attempts=2, optional=True),
     # never at runtime (OSM Overpass, OSMF vector tiles, Protomaps builds): §3.3
     "overpass-api.de": HostPolicy(denied=True, daily_hard=0),
     "vector.openstreetmap.org": HostPolicy(denied=True, daily_hard=0),
