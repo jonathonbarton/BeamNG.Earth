@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import random
+import ssl
 import threading
 import time
 from collections import deque
@@ -507,6 +508,20 @@ class CircuitBreaker:
 
 
 # --- transport ---------------------------------------------------------------------------------
+def _tls_context():
+    """Verify HTTPS against the operating system's certificate store (truststore), not only Python's bundled roots:
+    Overture's chain fails Python's check on Windows ("certificate has expired") although Windows trusts it.
+    Verification stays fully on; without truststore installed, Python's default verifying context."""
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_TLS = None
+
+
 class HttpsTransport:
     """GET over one persistent HTTP(S) connection per thread and host (a fresh TLS handshake per tile
     roughly doubled the latency). No redirects are followed."""
@@ -525,7 +540,12 @@ class HttpsTransport:
             reused = conn is not None
             if conn is None:
                 cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-                conn = conns[key] = cls(u.netloc, timeout=timeout)
+                global _TLS
+                if u.scheme == "https":
+                    _TLS = _TLS or _tls_context()
+                    conn = conns[key] = cls(u.netloc, timeout=timeout, context=_TLS)
+                else:
+                    conn = conns[key] = cls(u.netloc, timeout=timeout)
             try:
                 conn.request("GET", path, headers=dict(headers, Connection="keep-alive"))
                 r = conn.getresponse()
