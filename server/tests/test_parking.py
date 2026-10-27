@@ -104,6 +104,59 @@ class CurbTest(unittest.TestCase):
             self.assertGreaterEqual(math.hypot(s[0] - h[0], s[1] - 56.0), parking.HYDRANT_CLEAR_M)
 
 
+
+class NoParkingTest(unittest.TestCase):
+    """Where cars cannot park (the user, 2026-10-27: "If there was a curb in the center (dividing a road) then Beam
+    wanted to park cars against it too")."""
+
+    def test_not_against_a_median(self):
+        r = eligible()
+        ws = walks(r)
+        ws[0]["median"] = True
+        spots = parking.curb_spots([r], ws, (0, 0, 256, 256))
+        self.assertTrue(spots and all(s[1] < 50 for s in spots), "the median's side has none")
+
+    def test_divided_carriageway_parks_on_its_outer_side_only(self):
+        fid, spec, pts, lon = eligible()
+        r = (fid, spec._replace(oneway=True, dir=1, median=14.0), pts, lon)
+        spots = parking.curb_spots([r], walks(r), (0, 0, 256, 256), directions={fid: 1})
+        self.assertTrue(spots and all(s[1] < 50 for s in spots), "eastbound: the curb on its right (south)")
+        r = (fid, spec._replace(oneway=True, dir=1), pts, lon)
+        spots = parking.curb_spots([r], walks(r), (0, 0, 256, 256), directions={fid: 1})
+        self.assertTrue({s[1] > 50 for s in spots} == {True, False}, "a plain one-way: both curbs")
+
+    def test_not_on_a_ramp_a_bridge_or_a_bike_lane(self):
+        fid, spec, pts, lon = eligible()
+        r = (fid, spec._replace(link=True), pts, lon)
+        self.assertEqual(parking.curb_spots([r], walks(r), (0, 0, 256, 256)), [])
+        r = (fid, spec, pts, lon)
+        # the street runs x -300..600: 0.4..0.5 of it is x 60..150, on a bridge
+        spots = parking.curb_spots([r], walks(r), (0, 0, 256, 256), off_ground={fid: [(0.4, 0.5)]})
+        self.assertTrue(spots and not any(60 <= s[0] <= 150 for s in spots))
+        spots = parking.curb_spots([r], walks(r), (0, 0, 256, 256), no_sides={fid: {1}})
+        self.assertTrue(spots and all(s[1] < 50 for s in spots), "no parking in the bike lane on its left")
+
+    def test_no_park_sides_from_cycleway_tags(self):
+        from test_roads import features
+        f = features([[(0, 0), (100, 0)]] * 3, ["residential"] * 3)
+        f.attrs["osm_cycleway"] = np.array(["lane", "", "no"])
+        f.attrs["osm_cycleway_left"] = np.array(["", "", ""])
+        f.attrs["osm_cycleway_right"] = np.array(["", "track", ""])
+        self.assertEqual([parking.no_park_sides(f, i) for i in range(3)], [{1, -1}, {-1}, set()])
+
+    def test_clear_of_crosswalks_stop_lines_and_signals(self):
+        spots = [[x, 0.0, 0.0, 0.0] for x in range(0, 60, 2)] + [[1.0, 0.0, 0.0, 0.0, 1]]
+        cws = [{"a": np.array([0.0, -5.0]), "b": np.array([0.0, 5.0])},
+               {"a": np.array([30.0, -5.0]), "b": np.array([30.0, 5.0]), "stop": True}]
+        props = [[furniture.G_SIGNAL, 60.0, 0.0, 0.0]]
+        got = parking.clear_of_marks(spots, cws, props)
+        half = parking.SPOT_LEN_M / 2
+        for s in got[:-1]:
+            self.assertGreaterEqual(abs(s[0]), parking.CROSSWALK_CLEAR_M + half)
+            self.assertGreaterEqual(abs(s[0] - 30), parking.STOP_CLEAR_M + half)
+            self.assertGreaterEqual(abs(s[0] - 60), parking.STOP_CLEAR_M + half)
+        self.assertTrue(got and got[-1][4] == 1, "lot stalls stay")
+
 class LotTest(unittest.TestCase):
     LOT = np.array([(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)])
 

@@ -56,11 +56,15 @@ COLUMNS = {
     # for the segments Overture took from a relation (no way id: Samara's Novo-Sadovaya, "r3851280@53", drawn 10 m wide
     # instead of its 6 lanes, the user 2026-10-24): the way of the same name around them (join)
     "name": "name",
+    # bike lanes (parking.py: no parked cars in one)
+    "osm_cycleway": "cycleway", "osm_cycleway_left": "\"cycleway:left\"", "osm_cycleway_right": "\"cycleway:right\"",
     "bx0": "bbox.xmin", "by0": "bbox.ymin", "bx1": "bbox.xmax", "by1": "bbox.ymax",
 }
-USED = {"id", "bbox", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway", "layer", "name"}
+USED = {"id", "bbox", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway", "layer", "name",
+        "cycleway", "cycleway:left", "cycleway:right"}
 FLOATS = ("lanes", "width", "maxspeed", "osm_layer")
-TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway")
+TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway", "osm_cycleway", "osm_cycleway_left",
+         "osm_cycleway_right")
 NAME_MATCH_M = 25.0     # m a segment's middle may lie outside the bbox of the same-named way it takes the tags of
 
 
@@ -220,7 +224,7 @@ class OsmTags:
             # only the ways with a tag the roads use (and the raceways): join() treats a way without one as one not
             # here, and building a dict per way of every highway in the cell was most of this thread's CPU
             # (osmtags, 14 CPU-s of a Deck's teleport, 2026-10-23)
-            some = " OR ".join(f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"}))
+            some = " OR ".join(f"\"{c}\" IS NOT NULL" for c in sorted(USED - {"id", "bbox"}))
             rows = con.execute(f"""SELECT id, highway = 'raceway', file_row_number, {cols}
                 FROM read_parquet({uri}, file_row_number = true)
                 WHERE ({only}) AND {box} AND (highway = 'raceway' OR {some})""").fetchall()

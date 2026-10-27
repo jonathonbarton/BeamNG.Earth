@@ -26,26 +26,49 @@ STREET_SHARE = 0.85         # the share of eligible streets with curbside parkin
 CORNER_CLEAR_M = 9.0        # m kept clear of a run's ends (corners, crosswalks; US: 20 ft from a crosswalk)
 HYDRANT_CLEAR_M = 4.6       # m kept clear of a hydrant (US: 15 ft)
 DRIVE_CLEAR_M = 4.2         # m from a driveway's mouth to a spot's centre
+CROSSWALK_CLEAR_M = 6.1     # m kept clear between a car and a crosswalk (US: 20 ft) ...
+STOP_CLEAR_M = 9.1          # ... and a stop line, stop sign or signal (US: 30 ft)
+BIKE_LANE = {"lane", "track", "opposite_lane"}     # OpenStreetMap's cycleway values with a bike lane on that side
 
 
-def curb_spots(roads, walks, box, left_hand=False, directions=None):
+def no_park_sides(feats, i):
+    """The sides (+1 left of the geometry, -1 right) of road feature i with no parking: a bike lane there
+    (OpenStreetMap's cycleway, cycleway:left / :right, osmtags.py)."""
+    def tag(c):
+        v = feats.attrs.get(c)
+        return str(v[i]) if v is not None else ""
+    both = tag("osm_cycleway") in BIKE_LANE
+    return {s for s, c in ((1, "osm_cycleway_left"), (-1, "osm_cycleway_right")) if both or tag(c) in BIKE_LANE}
+
+
+def curb_spots(roads, walks, box, left_hand=False, directions=None, off_ground=None, no_sides=None):
     """Rows [x, y, z, heading] of the curbside spots of a tile box (x0, y0, x1, y1). roads: build_tile's
     (fid, spec, centreline (k, 3), lon); walks: its sidewalk runs (dicts with fid, pts, side, w). left_hand:
     traffic drives on the left (the car's left side to the curb). directions: fid -> +1 / -1, a one-way street's
-    traffic along / against its geometry (Overture's one-way rule; +1 when unknown)."""
+    traffic along / against its geometry (Overture's one-way rule; +1 when unknown). off_ground: fid -> [(start,
+    end)] fractions of its length on a bridge or in a tunnel; no_sides: fid -> sides with no parking
+    (no_park_sides). None on a ramp, against a divided road's median or a traffic island (the user, 2026-10-27:
+    "If there was a curb in the center (dividing a road) then Beam wanted to park cars against it too")."""
     x0, y0, x1, y1 = box
     by_fid = {fid: (spec, pts) for fid, spec, pts, _ in roads}
     out = []
     for wk in walks:
         fid = wk.get("fid")
-        if fid is None or "pts" not in wk or fid not in by_fid:
+        if fid is None or "pts" not in wk or fid not in by_fid or wk.get("median"):
             continue
         spec, line = by_fid[fid]
-        if not spec.urban or spec.cls not in PARK_CLASSES or spec.width < MIN_WIDTH_M:
+        if not spec.urban or spec.cls not in PARK_CLASSES or spec.width < MIN_WIDTH_M or spec.link:
             continue
         if furniture._h01(fid, "park") >= STREET_SHARE:
             continue
         side = wk["side"]
+        if side in (no_sides or {}).get(fid, ()):
+            continue
+        if spec.median and spec.oneway:     # a divided road's carriageway: the side facing the other one
+            d = (directions or {}).get(fid, spec.dir or 1)
+            if side == (1 if d >= 0 else -1) * (-1 if left_hand else 1):
+                continue
+        ranges = (off_ground or {}).get(fid, ())
         if spec.width < BOTH_SIDES_M and side != (1 if furniture._h01(fid, "parkside") < 0.5 else -1):
             continue
         run = np.asarray(wk["pts"], np.float64)
@@ -57,6 +80,10 @@ def curb_spots(roads, walks, box, left_hand=False, directions=None):
             q = p[:2] - away * (w / 2 + CURB_OFF_M)          # from the sidewalk's middle past the curb
             if not (x0 <= q[0] < x1 and y0 <= q[1] < y1):
                 continue
+            if ranges:
+                at = float(furniture._project(line, q[None])[0]) / max(float(furniture._arclen(line)[-1]), 1e-6)
+                if any(a - 0.01 <= at <= b + 0.01 for a, b in ranges):
+                    continue
             # the car's right side to the curb: heading h with right(h) = (h_y, -h_x) = away
             if spec.oneway:
                 _, d = furniture._at(line, furniture._project(line, q[None]))
@@ -84,6 +111,33 @@ def clear_of(spots, props, drives):
     dist = np.hypot(s[:, None, 0] - b[None, :, 0], s[:, None, 1] - b[None, :, 1])
     keep = (dist >= b[None, :, 2]).all(1)
     return [r for r, k in zip(spots, keep) if k]
+
+
+def clear_of_marks(spots, crosswalks=(), props=()):
+    """The curbside spots (rows of 4) whose car keeps CROSSWALK_CLEAR_M from a crosswalk and STOP_CLEAR_M from a
+    stop line (crosswalks: junctions' dicts a / b, stop), a stop sign or a signal (props rows of furniture.G_STOP /
+    G_SIGNAL); lot stalls as they are."""
+    segs = [(np.asarray(c["a"], np.float64)[:2], np.asarray(c["b"], np.float64)[:2],
+             STOP_CLEAR_M if c.get("stop") else CROSSWALK_CLEAR_M) for c in crosswalks or ()]
+    pts = [(np.array(r[1:3], np.float64), STOP_CLEAR_M) for r in props or ()
+           if r[0] in (furniture.G_STOP, furniture.G_SIGNAL)]
+    if not spots or not (segs or pts):
+        return spots
+    out = []
+    for r in spots:
+        q = np.array(r[:2], np.float64)
+        ok = len(r) > 4
+        if not ok:
+            ok = all(np.hypot(*(q - p)) >= c + SPOT_LEN_M / 2 for p, c in pts)
+            for a, b, c in segs if ok else ():
+                d = b - a
+                t = min(1.0, max(0.0, float((q - a) @ d) / max(float(d @ d), 1e-9)))
+                if np.hypot(*(a + t * d - q)) < c + SPOT_LEN_M / 2:
+                    ok = False
+                    break
+        if ok:
+            out.append(r)
+    return out
 
 
 LOT_SPOT_W_M = 2.6          # a lot's stall: width along its row ...

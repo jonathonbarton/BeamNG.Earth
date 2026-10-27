@@ -4375,7 +4375,10 @@ def build_tile(frame, tx, ty, cells, elev, urban_fn=None, walks=None, bridges=No
             if sp.oneway:
                 v = _rule_value(f.rules.get("oneway"), i)
                 dirs[fid] = (-1 if float(v) < 0 else 1) if v is not None else (sp.dir or 1)
-        park.extend(parking.curb_spots(roads, walks, (x0, y0, x1, y1), left_hand, dirs))
+        off = {fid: [(a, b) for a, b, _ in level_ranges(f, i)] for fid, (f, i, sp) in seen.items()}
+        nos = {fid: parking.no_park_sides(f, i) for fid, (f, i, sp) in seen.items()}
+        park.extend(parking.clear_of_marks(
+            parking.curb_spots(roads, walks, (x0, y0, x1, y1), left_hand, dirs, off, nos), crosswalks, props))
         aisles = {fid for fid, (f, i, sp) in seen.items()
                   if sp.kind == "paved" and _rule_value(f.rules.get("subclass"), i) == "parking_aisle"}
         if aisles:
