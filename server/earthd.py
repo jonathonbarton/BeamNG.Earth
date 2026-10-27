@@ -4350,6 +4350,7 @@ async def main_async(args):
         ml = farfield.MESH_MIN_LEVEL[args.cells]
         radii = {ml: args.near_radii[0], ml + 1: args.near_radii[1]}
     net = netfetch.Fetcher(stats_dir=os.path.join(args.cache_dir, "netstats"), offline=args.offline)
+    netfetch._default = net      # (code not handed one shares it: the bridge lookup, bridgeinfo.py)
     disk = cachemod.Cache(args.cache_dir, args.cache_cap)
     threading.Thread(target=prune_own_caches, args=(args.cache_dir,), daemon=True, name="cache-prune").start()
     # map data (mapdata.py): land cover for the surfaces, roads; one instance shares its cache locks
@@ -4792,6 +4793,12 @@ def main():
     ap.add_argument("--gravity", choices=("on", "off"), default="on",
                     help="real gravity at the player (gravity.py: WGS84 normal + EGM2008 from <cache-dir>/gravity/, "
                          "every 2 km or 200 m of height; normal gravity while EGM2008 downloads, once, 74 MB)")
+    ap.add_argument("--bridge-profile", choices=("auto", "curve", "standard"), default=None,
+                    help="bridge decks: auto (the default: curve over rivers, standard elsewhere), curve (clearance-aware "
+                         "grades and vertical curves, and the bridge lookup) or standard (1.6.3's deck profile)")
+    ap.add_argument("--bridge-lookup", choices=("on", "off"), default="on",
+                    help="look bridges up (FHWA NBI files in the cache, OpenStreetMap, Wikidata) for their "
+                         "clearance and type; off: rules only")
     ap.add_argument("--offline", action="store_true",
                     help="no network: serve elevation and imagery from the disk cache only (uncached tiles get "
                          "the palette, uncached terrain fails); the status says 'Offline - using cached data'")
@@ -4864,6 +4871,13 @@ def main():
                          "never what this session used within the hour, the gravity model or netstats/")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    # read by roads.py in this process and in the block workers (spawned after this: they inherit it)
+    if args.bridge_profile:
+        os.environ["BNE_BRIDGE_PROFILE"] = args.bridge_profile
+    os.environ["BNE_BRIDGE_LOOKUP"] = args.bridge_lookup
+    os.environ["BNE_CACHE_DIR"] = args.cache_dir
+    if args.offline:
+        os.environ["BNE_OFFLINE"] = "1"
     args.cells = resolve_cells(args.cells, args.near_visual)
     args.block = resolve_block(args.block, args.near_visual)
     args.horizon = resolve_horizon(args.horizon, args.near_visual)
