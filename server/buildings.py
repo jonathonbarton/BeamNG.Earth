@@ -161,7 +161,7 @@ BANDS = 4
 
 # Overture "bridge_structure" (OSM man_made=bridge parts with a height: the Queensboro Bridge's towers, 110 m) was a
 # glass tower the decks ran through (the user's report, 2026-10-17)
-BRIDGE_CLASSES = {"bridge_structure"}
+BRIDGE_CLASSES = {"bridge_structure", "bridge_tower"}
 BRIDGE_PIER_M = 12.0        # a bridge structure's height when not mapped
 STEEL_MATERIALS = ("", "steel", "metal", "iron")     # a part over a bridge support of these (or none mapped): steel
 MASONRY_MATERIALS = ("concrete", "stone", "brick", "masonry", "granite")
@@ -1371,7 +1371,11 @@ def build(specs_and_ground, lite=False):
             continue
         mat_idx = _Looks(spec.seed)
         if spec.cls in BRIDGE_CLASSES:
-            _steel_frame(m, spec, gmin, mat_idx[spec.facade if spec.facade in LOOKS else STEEL], lite)
+            # a tower the decks pass (bridge_tower): its legs only; the bridge's own structure draws its portal beams
+            # over the decks (a frame's bracing crossed the Vincent Thomas Bridge's lanes at truck height, drawn
+            # but not solid, 2026-10-28)
+            _steel_frame(m, spec, gmin, mat_idx[spec.facade if spec.facade in LOOKS else STEEL], lite,
+                         legs_only=spec.cls == "bridge_tower")
             continue
         ring = drawn_ring(spec)
         mh = spec.min_h or 0.0
@@ -2271,7 +2275,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                     # a tower the deck runs through (25 de Abril's pylons: building, bridge:support=pylon, 190 m) was
                     # a solid block with a tunnel for the road, 2026-10-28: an open frame on the ground, the decks
                     # between its legs
-                    at = dict(at, **{"class": "bridge_structure"}, facade_color=at.get("facade_color"))
+                    at = dict(at, **{"class": "bridge_tower"}, facade_color=at.get("facade_color"))
                     mh = 0.0
                 else:
                     at = dict(at, bridge_part=on) if fm_ in STEEL_MATERIALS else dict(at, bridge_masonry=fm_)
