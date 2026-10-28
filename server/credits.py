@@ -99,7 +99,7 @@ FEATURES = {
     "map:TomTom": "TomTom", "map:Esri Community Maps": "Esri", "map:Google Open Buildings": "Google",
     "map:USGS Lidar": "USGS Lidar", "map:doi:10.5281/zenodo.8174931": "Shi et al. (East Asia buildings)",
     "land:esa-worldcover": "ESA WorldCover", "canopy:meta-wri-chm": "Meta & WRI",
-    "sea:noaa": "NOAA NCEI", "bridge:nbi": "FHWA NBI", "bridge:wikidata": "Wikidata",
+    "sea:noaa": "NOAA NCEI", "bridge:nbi": "FHWA NBI", "bridge:fis": "Rijkswaterstaat FIS", "bridge:wikidata": "Wikidata",
     "air:ourairports": "OurAirports", "grav:egm2008": "NGA EGM2008", "climate:beck-kg": "Beck et al. (Koppen-Geiger)",
 }
 SHORT.update(FEATURES)
@@ -211,8 +211,8 @@ def feature_ids(conn):
     if roads_on:
         try:
             import bridgetypes
-            if len(bridgetypes.nbi_near(lat, lon, FEATURE_NEAR_M)[0]):
-                ids.add("bridge:nbi")
+            for i in bridgetypes.nbi_near(lat, lon, FEATURE_NEAR_M)[0]:
+                ids.add("bridge:fis" if bridgetypes.inventory_src(i) == 1 else "bridge:nbi")
             if bridgetypes.wd_near(lat, lon, FEATURE_NEAR_M):
                 ids.add("bridge:wikidata")
         except Exception:           # (the inventories are optional files)

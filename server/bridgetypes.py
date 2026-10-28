@@ -26,6 +26,9 @@ PLAIN = 2               # NBI's stringer / girder: a plain deck (Wikidata's beam
 TRUSS_TYPES = (NBI_DECK_TRUSS, NBI_THROUGH_TRUSS)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridges_us.npz")
+# the Netherlands' bridges over fairways (Rijkswaterstaat FIS, CC0: tools/build_bridge_nl.py), the same columns,
+# loaded with the NBI's as one inventory (src: 0 the NBI, 1 FIS)
+NL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridges_nl.npz")
 COVER_M = 25000.0       # an NBI record (any notable type) this close: the inventory covers here (no size rule)
 MATCH_M = 200.0         # an NBI record's point this close to a chain's deck lines may be that chain's (the points are
                         # rough: Golden Gate's lies 140 m off its deck) ...
@@ -202,12 +205,27 @@ def _osm_structure(frame, parts, feats_list):
 def _load():
     global _db
     if _db is None:
-        try:
-            d = np.load(DB_PATH)
-            _db = {k: d[k] for k in d.files}
-        except OSError:
+        parts = []
+        for src, path in ((0, DB_PATH), (1, NL_PATH)):
+            try:
+                d = np.load(path)
+            except OSError:
+                continue
+            parts.append(dict({k: d[k] for k in d.files}, src=np.full(len(d["lat"]), src, np.uint8)))
+        if not parts:
             _db = {"lat": np.zeros(0, np.float32)}
+        else:
+            keys = set.intersection(*(set(p) for p in parts))
+            m = {k: np.concatenate([p[k] for p in parts]) for k in keys}
+            o = np.argsort(m["lat"], kind="stable")
+            _db = {k: v[o] for k, v in m.items()}
     return _db
+
+
+def inventory_src(i):
+    """0: the record is the NBI's, 1: Rijkswaterstaat FIS's (the credits)."""
+    db = _load()
+    return int(db["src"][i]) if "src" in db else 0
 
 
 def nbi_near(lat, lon, r_m):
@@ -259,7 +277,7 @@ def nav_clearance(frame, lines):
     if "nav" not in db:
         return 0.0
     for _, i in matches(frame, lines):
-        if db["nav"][i] > 0 and nav_plausible(float(db["nav"][i]), float(db["span"][i]), int(db["type"][i])):
+        if db["nav"][i] > 0 and _nav_ok(db, i):
             return float(db["nav"][i])
     return 0.0
 
@@ -271,9 +289,18 @@ def nav_span(frame, lines):
     if "nav" not in db:
         return 0.0
     for _, i in matches(frame, lines):
-        if db["nav"][i] > 0 and nav_plausible(float(db["nav"][i]), float(db["span"][i]), int(db["type"][i])):
+        if db["nav"][i] > 0 and _nav_ok(db, i):
             return float(db["span"][i])
     return 0.0
+
+
+def _nav_ok(db, i):
+    """Whether record i's navigation clearance is usable: FIS's (src 1) are measured under the closed bridge and kept
+    as they are (the share-of-span rule refused the Erasmus Bridge's 10.1 m over its 200 m opening); the NBI's by
+    nav_plausible."""
+    if "src" in db and int(db["src"][i]) == 1:
+        return 2.0 <= float(db["nav"][i]) <= 80.0
+    return nav_plausible(float(db["nav"][i]), float(db["span"][i]), int(db["type"][i]))
 
 
 NAV_SPAN_MIN = 0.06         # a navigation clearance under this share of the record's main span (15 m at most) is not ...
