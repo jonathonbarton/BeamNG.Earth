@@ -195,7 +195,7 @@ class TrussTest(unittest.TestCase):
         beams = bt.truss_members([deck()], info, lambda xy: np.zeros(len(xy)))
         P, T, UV, mats, M = roadmesh.deck([], (0.0, 0.0, 0.0), beams=beams)
         self.assertIn(roadmesh.TRUSS_STEEL, mats)
-        self.assertEqual(len(T), 8 * len(beams))
+        self.assertEqual(len(T), 12 * len(beams))     # four sides and two capped ends
         self.assertEqual(len(P), 8 * len(beams))
 
 

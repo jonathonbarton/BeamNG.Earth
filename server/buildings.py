@@ -1657,6 +1657,8 @@ def _covers_garage(ring, garages):
     return False
 
 
+TOWER_FRAME_M = 40.0        # m: a steel bridge support this tall is a tower the decks pass (25 de Abril's 190 m pylons
+                            # as buildings were solid blocks across one carriageway, 2026-10-28): an open frame
 TUNNEL_THROUGH_M = 5.0      # a footprint a road tunnel runs into this far: its portal building, lifted over the tube
 PORTAL_SKIP_CLASSES = ("service",)     # tunnels that lift no building: a driveway, loading dock or covered drop-off
                             # under a building, which stands on the ground (GitHub #60: a 15 m drive-through under an
@@ -2263,7 +2265,9 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             on = _on_support(ring, supports)
             if on is not None:              # a bridge's own: no flats' windows (Tower Bridge's towers, the user 2026-10-18)
                 fm_ = str(at.get("facade_material") or "").lower()
-                if through:
+                h_ = at.get("height")
+                tall = h_ is not None and np.isfinite(h_) and h_ >= TOWER_FRAME_M and fm_ in STEEL_MATERIALS
+                if through or tall:
                     # a tower the deck runs through (25 de Abril's pylons: building, bridge:support=pylon, 190 m) was
                     # a solid block with a tunnel for the road, 2026-10-28: an open frame on the ground, the decks
                     # between its legs

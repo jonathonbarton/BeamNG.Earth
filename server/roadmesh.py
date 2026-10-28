@@ -708,9 +708,12 @@ def _beams(beams, origin, P, T, UV, M, mat):
     UV.append(np.stack([np.broadcast_to(u, (n, 8)), np.c_[np.zeros((n, 4)), np.repeat(ln[:, None] / 4.0, 4, 1)]],
                        -1).reshape(-1, 2))
     tri = []
-    for i in range(4):                          # the four sides (ends left open: they meet other beams)
+    for i in range(4):                          # the four sides
         j = (i + 1) % 4
         tri += [(i, j, j + 4), (i, j + 4, i + 4)]
+    # and both ends: a cable's or a hanger's open end showed its hollow inside where it met nothing (25 de Abril,
+    # 2026-10-28)
+    tri += [(0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7)]
     tri = np.array(tri, np.int64)
     Tn = (tri[None] + (np.arange(n) * 8)[:, None, None]).reshape(-1, 3)
     pts = np.concatenate([V.reshape(-1, 3)])
