@@ -16,6 +16,7 @@ footprints and a ground-height function; no game state.
 import os
 import hashlib
 import math
+import re
 
 import numpy as np
 
@@ -41,6 +42,8 @@ TILE_PX_M = 12.0            # m of wall per 1024 px of the window sheets (5 sash
 ROOF_UV_M = 6.0             # m per repeat of the roof textures
 SIDING_UV_M = 3.0           # m per repeat of the plain wall textures (sheds, garages)
 PITCH = {"gabled": 32.0, "hipped": 26.0}     # degrees
+BARREL_RISE = 0.45          # an arched roof's rise, of its half span (a Quonset hut 1.0; halls and hangars lower)
+BARREL_MAX_HW = 45.0        # m: an arched roof spans at most twice this
 EAVE_M = 0.35               # m a pitched roof overhangs its walls
 CORNICE_OUT_M = 0.28        # a flat roof's cornice: how far it stands out, its depth below and above the eave
 CORNICE_DOWN_M = 0.45
@@ -257,7 +260,7 @@ def oriented_box(p):
 class Spec:
     """What is built for one footprint (decided by plan())."""
     __slots__ = ("ring", "floors", "floor_h", "height", "roof", "roof_mat", "facade", "band", "shop", "plain", "min_h", "wall", "door", "windows", "front", "steeple", "stoop",
-                 "sign", "porch", "cls", "seed", "deck", "pitch", "portal", "gring")
+                 "sign", "porch", "cls", "seed", "deck", "pitch", "portal", "gring", "circle")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -439,6 +442,8 @@ def plan(ring, attrs, neighbours=0, lat=None, lon=None, look=None, town=False, d
         return Spec(ring=ring, floors=1, floor_h=h, height=h, roof="flat", roof_mat="bne_precast", facade="bne_precast",
                     band=None, shop=False, plain=True, seed=seed, min_h=0.0, wall=None, windows=False, steeple=False,
                     porch=False, cls="elevator", deck=False, pitch=None)
+    if attrs.get("landmark") in LANDMARK_CLASSES:     # a ship, a dome, a tank (landmark_kind)
+        return landmark_spec(attrs["landmark"], ring, attrs, seed)
     if attrs.get("bridge_part"):    # a mapped part of a bridge's tower (support_rings): a plain box of painted steel
         return Spec(ring=ring, floors=1, floor_h=h or BRIDGE_PIER_M, height=h or BRIDGE_PIER_M, roof="flat",
                     roof_mat=f"{STEEL}|{attrs['bridge_part']}", facade=f"{STEEL}|{attrs['bridge_part']}", band=None,
@@ -493,7 +498,9 @@ def plan(ring, attrs, neighbours=0, lat=None, lon=None, look=None, town=False, d
         roof = roof_given
     elif roof_given in ("pyramidal", "half-hipped", "mansard", "gambrel"):
         roof = "hipped"
-    elif roof_given in ("skillion", "dome", "onion", "round", "saltbox"):
+    elif roof_given in ("round", "barrel", "arched"):
+        roof = "barrel"                         # an arched hall (OSM roof:shape=round): _roof's vault
+    elif roof_given in ("skillion", "dome", "onion", "saltbox"):
         roof = "gabled"
     else:
         detached_house = (cls in HOUSE_CLASSES or (area < 260 and not shop)) and not industrial and not row
@@ -518,7 +525,7 @@ def plan(ring, attrs, neighbours=0, lat=None, lon=None, look=None, town=False, d
             roof = "flat"
     # pitched roofs only on near-rectangular footprints (a church's nave keeps its gable beside a tower or an apse)
     if roof != "flat" and (box_fill < (0.6 if church else 0.8) or hw < 2.0
-                           or hw > (18.0 if barn else 20.0 if church else 14.0)):
+                           or hw > (BARREL_MAX_HW if roof == "barrel" else 18.0 if barn else 20.0 if church else 14.0)):
         roof = "flat"
     # a city tower's ground floor is shops or a lobby (Midtown, 2026-10-14: most towers have no class, and their
     # curtain wall came down to the pavement)
@@ -534,6 +541,8 @@ def plan(ring, attrs, neighbours=0, lat=None, lon=None, look=None, town=False, d
     else:
         if attrs.get("roof_height") and np.isfinite(attrs["roof_height"]) and roof != "flat":
             h = max(2.5, h - float(attrs["roof_height"]))
+        elif roof == "barrel":
+            h = max(2.5, h - hw * BARREL_RISE)
         elif roof != "flat":
             h = max(2.5, h - hw * math.tan(math.radians(style.pitch or PITCH[roof])))
         if nf is None:
@@ -665,6 +674,288 @@ def plan(ring, attrs, neighbours=0, lat=None, lon=None, look=None, town=False, d
                 windows=windows, steeple=church and area < 2500, porch=porch, cls=cls,
                 deck=garage and roof == "flat", pitch=style.pitch)
 
+
+# ------------------------------------------------------------------------------------------- landmarks
+# Footprints that are not a box with a roof, told from the outline (2026-10-28, the user's San Pedro and San Jose
+# shots): the Battleship USS Iowa (OSM building=ship, historic=ship) and the Queen Mary (historic=ship) were 9-storey
+# apartment blocks, the Century 21 dome theatre a windowed round block. Overture keeps neither tag (no "ship" class;
+# OSM itself maps no roof:shape on the dome), so a ship is a long pointed hull on water or with a ship's name, a dome
+# a round footprint that is not a house or a tower, a tank a small round one of a tank's class or without a name.
+SHIP_SLENDER = 3.0          # a hull: at least this many times as long as wide ...
+SHIP_MAX_SLENDER = 10.0     # ... at most this many (real hulls 5-9: the Iowa 8.2, the Queen Mary 8.6; a 90 x 6 m
+                            # pontoon walkway beside the Queen Mary is not one) ...
+SHIP_MIN_L = 25.0           # ... at least this long (m) ...
+SHIP_FILL = (0.5, 0.92)     # ... filling this share of its oriented box (pointed or rounded ends) ...
+SHIP_END_SHARE = 0.65       # ... one end at most this share of the beam wide over its last SHIP_END_L of length
+SHIP_END_L = 0.06
+SHIP_NAME = re.compile(r"\b(uss|ss|hms|rms|mv|ms|uscgc|battleship|ship|schooner|steamer|steamship|lightship|"
+                       r"submarine|frigate|destroyer|cruiser|aircraft carrier|liner|queen mary|ferry|sailing)\b")
+NAVY_NAME = re.compile(r"\b(uss|hms|uscgc|battleship|submarine|frigate|destroyer|cruiser|carrier)\b")
+SHIP_FREEBOARD = (3.0, 12.0)    # m: the deck over the water (0.6 of the half beam, in this range)
+SHIP_TIER_M = 3.2           # m per deck of the superstructure
+SHIP_PART_BIG_M = 10.0      # m: a ship's mapped part this long (half) is superstructure; smaller ones turrets, guns
+SHIP_TURRET_M = 3.5         # m: a turret's height over the deck
+SHIP_TOP_SHARE = 0.15       # a ship over 60 m: its mast tops this share of its length over the water
+CIRCLE_SEGS = 32            # a dome's or a tank's circle drawn with this many sides
+DOME_ANNEX_M = 5.0          # m: the rest of a dome's outline (a lobby, an entrance) one plain storey
+ROUND_MIN_VERTS = 10        # a round footprint (circle_fit) is drawn with at least this many corners ...
+ROUND_TOL = 0.12            # circle_fit: corners this share of the radius off the circle are on it ...
+ROUND_SHARE = 0.6           # ... this share of the corners at least ...
+ROUND_GAP_DEG = 75.0        # ... with no wider gap round the centre ...
+ROUND_DISC_SHARE = 0.6      # ... and the disc this share of the footprint at least
+DOME_MIN_D = 18.0           # m: a round building this wide is a dome (smaller: a tank or a kiosk) ...
+DOME_MAX_SLENDER = 0.9      # ... unless taller than this many times its width (a round tower) ...
+DOME_MAX_D = 230.0          # ... or wider than this (the Superdome 210 m)
+ROUND_NOT_CLASSES = {"roof", "carport", "shelter", "garage", "garages", "parking", "parking_garage", "bridge_structure",
+                     "bridge_tower"}
+DOME_DRUM_SHARE = 0.35      # of the height: the drum under the cap
+TANK_CLASSES = {"storage_tank", "silo", "grain_silo", "slurry_tank", "digester", "tank", "gasometer"}
+TANK_MAX_D = 90.0
+ROUND_HOME_CLASSES = HOUSE_CLASSES | {"apartments", "terrace", "dormitory", "hotel"}
+ARCH_SEGS = 10              # segments of a barrel roof's arch / a dome's quarter
+
+
+def _open_ring(ring):
+    """The ring without a repeated last corner, counter-clockwise."""
+    r = np.asarray(ring, np.float64)
+    if len(r) > 1 and np.allclose(r[0], r[-1]):
+        r = r[:-1]
+    return r if _area2(r) >= 0 else r[::-1]
+
+
+def circle_fit(ring):
+    """(centre (2,), radius) of the round part of a footprint, or None: a least-squares circle through its corners,
+    refitted on the corners within ROUND_TOL of it, which must be most of them, all round (no gap over ROUND_GAP_DEG)
+    and its disc most of the footprint (the Century 21 dome's outline carries its lobby: 4 pi A / P^2 0.72)."""
+    r = _open_ring(ring)
+    if len(r) < ROUND_MIN_VERTS:
+        return None
+    pts = r
+    for _ in range(2):
+        A = np.column_stack([2 * pts[:, 0], 2 * pts[:, 1], np.ones(len(pts))])
+        try:
+            sol = np.linalg.lstsq(A, (pts ** 2).sum(1), rcond=None)[0]
+        except np.linalg.LinAlgError:
+            return None
+        c = sol[:2]
+        R = math.sqrt(max(sol[2] + c @ c, 0.0))
+        if R <= 0:
+            return None
+        d = np.hypot(*(r - c).T)
+        keep = np.abs(d - R) <= ROUND_TOL * R
+        if keep.sum() < ROUND_MIN_VERTS:
+            return None
+        pts = r[keep]
+    ang = np.sort(np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0]))
+    gap = np.max(np.diff(np.concatenate([ang, ang[:1] + 2 * math.pi])))
+    if keep.mean() < ROUND_SHARE or math.degrees(gap) > ROUND_GAP_DEG             or math.pi * R * R < ROUND_DISC_SHARE * _area2(r) / 2:
+        return None
+    return c, R
+
+
+def roundness(ring):
+    """4 pi A / P^2 of the footprint (1 a circle, a square 0.785)."""
+    r = _open_ring(ring)
+    per = float(np.hypot(*(np.roll(r, -1, 0) - r).T).sum())
+    return 4 * math.pi * (_area2(r) / 2) / max(per * per, 1e-9)
+
+
+def _end_widths(ring, c, u, hl):
+    """The footprint's width across u over its last SHIP_END_L of length at each end (sampled along its edges)."""
+    r = _open_ring(ring)
+    v = np.array([-u[1], u[0]])
+    t = np.linspace(0, 1, 6)[:, None, None]
+    pts = (r[None] + (np.roll(r, -1, 0) - r)[None] * t).reshape(-1, 2) - c
+    s, d = pts @ u, pts @ v
+    out = []
+    for sgn in (-1, 1):
+        k = (sgn * s) >= hl * (1 - 2 * SHIP_END_L)
+        out.append(float(d[k].max() - d[k].min()) if k.any() else 0.0)
+    return out
+
+
+def landmark_kind(ring, attrs, on_water=False, ml=False):
+    """"ship", "dome", "tank" or None for a footprint (local ring) and its attributes (class, name, height,
+    roof_shape). Machine-learned outlines are never landmarks (their round and pointed blobs are trees and boats)."""
+    if ml:
+        return None
+    rs = str(attrs.get("roof_shape") or "").lower()
+    cls = str(attrs.get("class") or "").lower()
+    name = str(attrs.get("name") or "").lower()
+    r = _open_ring(ring)
+    area = _area2(r) / 2
+    c, u, hl, hw = oriented_box(r)
+    if 2 * hl >= SHIP_MIN_L and SHIP_SLENDER * hw <= hl <= SHIP_MAX_SLENDER * hw and cls in ("", "yes", "ship", "museum") \
+            and SHIP_FILL[0] <= area / max(4 * hl * hw, 1e-6) <= SHIP_FILL[1] \
+            and (on_water or SHIP_NAME.search(name)) \
+            and min(_end_widths(r, c, u, hl)) <= SHIP_END_SHARE * 2 * hw:
+        return "ship"
+    if rs in ("dome", "onion"):
+        return "dome"
+    if attrs.get("holed") or cls in ROUND_NOT_CLASSES:
+        return None                 # a ring round a courtyard (Apple Park), a canopy
+    fit = circle_fit(r)
+    if fit is None:
+        return None
+    d = 2 * fit[1]
+    h = attrs.get("height")
+    h = float(h) if h is not None and np.isfinite(h) and h > 0 else None
+    if cls in TANK_CLASSES or (not name and cls in ("", "yes", "industrial") and (h is None or h <= 1.5 * d)):
+        # (unnamed round buildings without a class are tanks: OSM building=yes + man_made=storage_tank, Overture
+        # keeping neither; Cupertino's 40-70 m ones came out as domes)
+        return "tank" if d <= TANK_MAX_D else None
+    if d < DOME_MIN_D or d > DOME_MAX_D or cls in ROUND_HOME_CLASSES or (h is not None and h > DOME_MAX_SLENDER * d):
+        return None
+    return "dome"
+
+
+def landmark_spec(kind, ring, attrs, seed):
+    """plan()'s Spec for a landmark_kind footprint (cls the kind; build() draws it: _ship, _dome, _tank)."""
+    r = _open_ring(ring)
+    _, _, hl, hw = oriented_box(r)
+    h = attrs.get("height")
+    h = float(h) if h is not None and np.isfinite(h) and h > 0 else None
+    fit = circle_fit(r) if kind != "ship" else None
+    if fit is None:
+        fit = (oriented_box(r)[0], hw)          # (a dome by its tag on an outline that is not round)
+    d = 2 * fit[1]
+    if kind == "ship":
+        navy = bool(NAVY_NAME.search(str(attrs.get("name") or "").lower()))
+        fb = float(np.clip(0.6 * hw, *SHIP_FREEBOARD))
+        # the mapped height of a ship is its hull's or a guess (the Iowa 17.4 m, the Queen Mary 10 m); its masts and
+        # funnels stand about SHIP_TOP_SHARE of its length over the water
+        h = max(h or 0.0, fb + 3 * SHIP_TIER_M, SHIP_TOP_SHARE * 2 * hl if 2 * hl >= 60 else 0.0)
+        hull, upper = (f"{STEEL}|grey", f"{STEEL}|grey") if navy else (f"{STEEL}|black", f"{STEEL}|white")
+        # (floor_h: the freeboard; wall: the superstructure's paint)
+        return Spec(ring=r, floors=1, floor_h=fb, height=h, roof="flat", roof_mat=f"{ROOF_METAL}|1", facade=hull,
+                    wall=upper, band=None, shop=False, plain=True, seed=seed, min_h=0.0, windows=False,
+                    steeple=False, porch=False, cls="ship", deck=False, pitch=None,
+                    circle=attrs.get("ship_parts"))   # (its mapped parts: _ship)
+    if kind == "tank":
+        h = h or float(np.clip(0.6 * d, 6.0, 20.0))
+        return Spec(ring=r, floors=1, floor_h=h, height=h, roof="flat", roof_mat=f"{STEEL}|white",
+                    facade=f"{STEEL}|white", band=None, shop=False, plain=True, seed=seed, min_h=0.0, wall=None,
+                    windows=False, steeple=False, porch=False, cls="tank", deck=False, pitch=None, circle=fit)
+    h = h or float(np.clip(0.4 * d, 8.0, 30.0))
+    return Spec(ring=r, floors=1, floor_h=h, height=h, roof="flat", roof_mat=f"{ROOF_FLAT}|0",
+                facade=f"{PANEL}|0", band=None, shop=False, plain=True, seed=seed, min_h=0.0, wall=None,
+                windows=False, steeple=False, porch=False, cls="dome", deck=False, pitch=None, circle=fit)
+
+
+LANDMARK_CLASSES = {"ship", "dome", "tank"}
+
+
+def _plain_walls(m, ring, z0, z1, mat, uv_m=SIDING_UV_M):
+    """Plain walls round a ring, facing out."""
+    r = _open_ring(ring)
+    s = 0.0
+    for i in range(len(r)):
+        a, b = r[i], r[(i + 1) % len(r)]
+        L = float(np.hypot(*(b - a)))
+        m.quad((a[0], a[1], z0), (b[0], b[1], z0), (b[0], b[1], z1), (a[0], a[1], z1),
+               (s / uv_m, z0 / uv_m), ((s + L) / uv_m, z0 / uv_m), ((s + L) / uv_m, z1 / uv_m), (s / uv_m, z1 / uv_m),
+               mat)
+        s += L
+
+
+def _cap(m, ring, z0, rise, mat, segs=ARCH_SEGS, top_share=0.0):
+    """A dome over a ring from z0: each corner drawn toward the centre on a quarter ellipse rise high, closed at the
+    top (top_share > 0: cut flat at that share of the width, a tank's low cone)."""
+    r = _open_ring(ring)
+    c = r.mean(0)
+    th_max = math.acos(top_share) if top_share > 0 else math.pi / 2
+    prev = None
+    for k in range(segs + 1):
+        th = th_max * k / segs
+        f, z = math.cos(th), z0 + rise * math.sin(th) / math.sin(th_max)
+        cur = [(float(c[0] + (p[0] - c[0]) * f), float(c[1] + (p[1] - c[1]) * f), z) for p in r]
+        if prev is not None:
+            for i in range(len(r)):
+                j = (i + 1) % len(r)
+                m.quad(prev[i], prev[j], cur[j], cur[i], (i / 4.0, k / 4.0), (j / 4.0, k / 4.0),
+                       (j / 4.0, (k + 1) / 4.0), (i / 4.0, (k + 1) / 4.0), mat)
+        prev = cur
+    m.poly(prev, [(p[0] / ROOF_UV_M, p[1] / ROOF_UV_M) for p in prev], mat)
+
+
+def _circle(spec, segs=CIRCLE_SEGS):
+    c, R = spec.circle
+    t = np.linspace(0, 2 * math.pi, segs, endpoint=False)
+    return np.column_stack([c[0] + R * np.cos(t), c[1] + R * np.sin(t)])
+
+
+def _dome(m, spec, gmin, gmax, mat_idx, lite=False):
+    """A round hall: the outline one plain storey (its lobby: a flat roof round the drum), a plain drum on its fitted
+    circle (circle_fit) and a dome over it to the mapped height."""
+    z0, zb = gmin - (SKIRT_LITE_M if lite else SKIRT_M), base_z(spec, gmin, gmax)
+    drum = DOME_DRUM_SHARE * spec.height
+    annex = min(DOME_ANNEX_M, drum)
+    circ = _circle(spec, 16 if lite else CIRCLE_SEGS)
+    r = _open_ring(spec.ring)
+    _plain_walls(m, r, z0, zb + annex, mat_idx[spec.facade])
+    m.poly([(p[0], p[1], zb + annex) for p in r], [(p[0] / ROOF_UV_M, p[1] / ROOF_UV_M) for p in r],
+           mat_idx[f"{ROOF_FLAT}|1"])
+    _plain_walls(m, circ, zb + annex - 0.3, zb + drum, mat_idx[spec.facade])
+    _cap(m, circ, zb + drum, spec.height - drum, mat_idx[spec.roof_mat], 4 if lite else ARCH_SEGS)
+
+
+def _tank(m, spec, gmin, gmax, mat_idx, lite=False):
+    """A storage tank: a plain cylinder on its fitted circle under a low cone."""
+    z0, zb = gmin - (SKIRT_LITE_M if lite else SKIRT_M), base_z(spec, gmin, gmax)
+    circ = _circle(spec, 12 if lite else CIRCLE_SEGS)
+    _plain_walls(m, circ, z0, zb + spec.height, mat_idx[spec.facade])
+    _cap(m, circ, zb + spec.height, min(0.16 * spec.circle[1], 2.5), mat_idx[spec.roof_mat], 2, top_share=0.15)
+
+
+def _ship(m, spec, gmin, gmax, mat_idx, lite=False):
+    """A moored ship on its footprint: the hull (the outline's own pointed ends) from under the water to the deck
+    spec.floor_h over the footprint's highest ground (the water or the quay), a flat deck, and on it: its mapped parts
+    (spec.circle: [(local ring, mapped height or None)]; the Iowa's turrets and bridge, no heights: blocks by their
+    size; the Queen Mary's three funnels, with heights: funnels), else a stepped superstructure amidships (each deck
+    shorter and narrower) and funnels; two masts to the mapped height."""
+    r = _open_ring(spec.ring)
+    c, u, hl, hw = oriented_box(r)
+    zb = base_z(spec, gmin, gmax)
+    zd, top = zb + spec.floor_h, zb + spec.height
+    hull, upper = mat_idx[spec.facade], mat_idx[spec.wall]
+    fun = mat_idx[f"{STEEL}|grey" if spec.facade == f"{STEEL}|grey" else f"{STEEL}|red"]  # navy grey, else red
+    _plain_walls(m, r, gmin - (SKIRT_LITE_M if lite else SKIRT_M), zd, hull)
+    m.poly([(p[0], p[1], zd) for p in r], [(p[0] / ROOF_UV_M, p[1] / ROOF_UV_M) for p in r], mat_idx[spec.roof_mat])
+    parts = spec.circle or []
+    blocks = [(oriented_box(np.asarray(pr, np.float64))) for pr, ph in parts if ph is None]
+    funnels = [np.asarray(pr, np.float64).mean(0) for pr, ph in parts if ph is not None]
+    z = zd
+    if any(phl >= SHIP_PART_BIG_M for _, _, phl, _ in blocks):
+        for pc, pu, phl, phw in blocks:     # superstructure: tiers to 0.6 of the height; turrets; small guns
+            if phl >= SHIP_PART_BIG_M:
+                zz, L, W = zd, phl, phw
+                while zz + SHIP_TIER_M <= zd + 0.6 * (top - zd) and W > 1.5:
+                    _box(m, pc, pu, L, W, zz, zz + SHIP_TIER_M, upper)
+                    zz, L, W = zz + SHIP_TIER_M, L * 0.8, W * 0.85
+                z = max(z, zz)
+            else:
+                _box(m, pc, pu, phl, phw, zd, zd + (SHIP_TURRET_M if phl >= 4.0 else 2.0), upper)
+    else:
+        Ls, Ws = 0.42 * hl, 0.7 * hw
+        while z + SHIP_TIER_M <= top - 0.25 * (top - zd) and Ws > 1.5 and z < zd + 6 * SHIP_TIER_M:
+            _box(m, c, u, Ls, Ws, z, z + SHIP_TIER_M, upper)
+            z, Ls, Ws = z + SHIP_TIER_M, Ls * 0.72, Ws * 0.85
+    if lite:
+        return
+    fr = max(0.9, 0.18 * hw)
+    if funnels:                             # mapped: from the deck to 0.85 of the height
+        for p in funnels:
+            _box(m, p, u, fr * 1.3, fr, zd, zd + 0.85 * (top - zd), fun)
+    elif not blocks:
+        nf = 2 if hl > 60 else 1
+        for k in range(nf):
+            _box(m, c + u * ((k - (nf - 1) / 2) * 0.3 * hl - 0.05 * hl), u, fr * 1.3, fr, z,
+                 z + max(4.0, 0.5 * (top - z)), fun)
+    mt = max(0.3, 0.02 * hw)
+    yard = top - 0.15 * (top - zd)
+    for s in (0.38 * hl, -0.30 * hl):
+        _box(m, c + u * s, u, mt, mt, zd, top, upper)
+        _box(m, c + u * s, u, mt, 0.4 * hw, yard, yard + 2 * mt, upper)
 
 class Mesh:
     """Positions, uvs, colours, triangles and their material index, appended to. A material is a token
@@ -1039,6 +1330,9 @@ def _roof(m, spec, ring, z_eave, mat_idx):
 
     def uv(s, t):            # along the ridge, up the slope (m / ROOF_UV_M)
         return (s / ROOF_UV_M, (hw2 - abs(t)) / hw2 * slope / ROOF_UV_M)
+    if spec.roof == "barrel":
+        _barrel(m, spec, c, u, v, hl, hw, z_eave, rm, mat_idx[spec.facade])
+        return
     if spec.roof == "gabled":
         r = hl2
         m.quad(at(-hl2, -hw2, ze), at(hl2, -hw2, ze), at(r, 0, zr), at(-r, 0, zr),
@@ -1064,6 +1358,34 @@ def _roof(m, spec, ring, z_eave, mat_idx):
               (-hw2 / ROOF_UV_M, 0), (hw2 / ROOF_UV_M, 0), (0, slope / ROOF_UV_M), rm)
         m.tri(at(-hl2, hw2, ze), at(-hl2, -hw2, ze), at(-r, 0, zr),
               (-hw2 / ROOF_UV_M, 0), (hw2 / ROOF_UV_M, 0), (0, slope / ROOF_UV_M), rm)
+
+
+def _barrel(m, spec, c, u, v, hl, hw, z_eave, rm, fac):
+    """An arched (barrel) roof along the oriented box's long axis: an elliptic arch BARREL_RISE of the half span
+    high, overhanging the walls by EAVE_M, its end walls the facade's plain colour."""
+    hw2, hl2, rise = hw + EAVE_M, hl + EAVE_M, hw * BARREL_RISE
+    ths = [math.pi * k / ARCH_SEGS for k in range(ARCH_SEGS + 1)]
+    arch = [(-hw2 * math.cos(t), z_eave + rise * math.sin(t)) for t in ths]       # (across, z) from -v to +v
+
+    def at(s, t, z):
+        p = c + u * s + v * t
+        return (float(p[0]), float(p[1]), float(z))
+    run = 0.0
+    for (t0, z0), (t1, z1) in zip(arch[:-1], arch[1:]):
+        d = math.hypot(t1 - t0, z1 - z0)
+        m.quad(at(-hl2, t0, z0), at(hl2, t0, z0), at(hl2, t1, z1), at(-hl2, t1, z1),
+               (-hl2 / ROOF_UV_M, run / ROOF_UV_M), (hl2 / ROOF_UV_M, run / ROOF_UV_M),
+               (hl2 / ROOF_UV_M, (run + d) / ROOF_UV_M), (-hl2 / ROOF_UV_M, (run + d) / ROOF_UV_M), rm)
+        run += d
+    for sgn in (-1, 1):             # the end walls under the arch (a fan from the eave line's middle)
+        s = sgn * hl
+        mid = at(s, 0, z_eave)
+        pts = [at(s, t * hw / hw2, z) for t, z in arch]
+        for a, b in zip(pts[:-1], pts[1:]):
+            if sgn > 0:
+                m.tri(mid, b, a, (0, 0.995), (0.02, 0.995), (0.01, 0.999), fac)
+            else:
+                m.tri(mid, a, b, (0, 0.995), (0.02, 0.995), (0.01, 0.999), fac)
 
 
 # The engine draws a shape's mesh with 16-bit indices: past 65,535 vertices they wrap and triangles join far-apart
@@ -1377,6 +1699,9 @@ def build(specs_and_ground, lite=False):
             _steel_frame(m, spec, gmin, mat_idx[spec.facade if spec.facade in LOOKS else STEEL], lite,
                          legs_only=spec.cls == "bridge_tower")
             continue
+        if spec.cls in LANDMARK_CLASSES:
+            (_ship if spec.cls == "ship" else _dome if spec.cls == "dome" else _tank)(m, spec, gmin, gmax, mat_idx, lite)
+            continue
         ring = drawn_ring(spec)
         mh = spec.min_h or 0.0
         if spec.deck and not lite and _parking_deck(m, spec, gmin, gmax, mat_idx):
@@ -1469,7 +1794,7 @@ def collision_mesh(specs_and_ground):
             ring = ring[::-1]
         mh = spec.min_h or 0.0
         z0 = gmin - FOUNDATION_M if mh <= 0.5 else base_z(spec, gmin, gmax) + mh
-        z1 = base_z(spec, gmin, gmax) + mh + spec.height
+        z1 = base_z(spec, gmin, gmax) + mh + (spec.floor_h if spec.cls == "ship" else spec.height)   # (a ship: its deck)
         for i in range(len(ring)):
             a, b = ring[i], ring[(i + 1) % len(ring)]
             m.quad((a[0], a[1], z0), (b[0], b[1], z0), (b[0], b[1], z1), (a[0], a[1], z1), zero, zero, zero, zero, tok)
@@ -1885,14 +2210,19 @@ def _ml_false(ring, bridges_xy, water_xy, roads_xy=None):
         return True
     if roads_xy and (_line_dist(ring.mean(0), roads_xy) <= ML_ROAD_M or _in_median(ring.mean(0), roads_xy)):
         return True
-    if water_xy:
-        from polygon import Path
-        c = ring.mean(0)
-        for w, holes in water_xy:
-            if w[:, 0].min() <= c[0] <= w[:, 0].max() and w[:, 1].min() <= c[1] <= w[:, 1].max() \
-                    and Path(w).contains_points(c[None])[0] \
-                    and not any(Path(h).contains_points(c[None])[0] for h in holes):    # (an island: land)
-                return True
+    return _on_water(ring.mean(0), water_xy)
+
+
+def _on_water(c, water_xy):
+    """Whether point c (local) lies on mapped water (water_rings), not on an island in it."""
+    if not water_xy:
+        return False
+    from polygon import Path
+    for w, holes in water_xy:
+        if w[:, 0].min() <= c[0] <= w[:, 0].max() and w[:, 1].min() <= c[1] <= w[:, 1].max() \
+                and Path(w).contains_points(c[None])[0] \
+                and not any(Path(h).contains_points(c[None])[0] for h in holes):    # (an island: land)
+            return True
     return False
 
 
@@ -2202,11 +2532,21 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                     continue
             at = {k: (a[k][i] if k in a else None) for k in
                   ("class", "height", "num_floors", "min_height", "roof_shape", "roof_height", "name", "facade_material")}
+            if len(parts[0]) > 1 or len(parts) > 1:
+                at["holed"] = True              # (landmark_kind: a ring round a courtyard is no dome)
             hh_ = at.get("height")
             if hh_ is not None and np.isfinite(hh_) and 0 < hh_ < FLAT_FOOTPRINT_M and not parts_of.get(str(key)):
                 continue                # a mapped area, not a building (the Golden Gate toll plaza's 0.01 m footprint
                                         # drew a slab with a rim round the booths, 2026-10-21)
             bparts = parts_of.get(str(key)) if key is not None else None
+            funnels = None
+            if bparts and "src_dataset" in a and str(a["src_dataset"][i]) == "OpenStreetMap":
+                # a ship drawn as its hull with parts on it (the Iowa's turrets, the Queen Mary's funnels): the ship,
+                # its parts on its deck (_ship)
+                ring_ = clean_ring(np.stack([e - x0, n - y0], 1))
+                if ring_ is not None and landmark_kind(ring_, at) == "ship":
+                    funnels = [(pr - np.array([x0, y0]), None if hh is None else hh[0]) for pr, hh in bparts]
+                    bparts = None
             if bparts and any(h is not None for _, h in bparts):
                 # drawn as its parts, with the building's class and one look for all of them; a part
                 # without a height takes the building's (else its lowest known part's)
@@ -2281,6 +2621,10 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                     at = dict(at, bridge_part=on) if fm_ in STEEL_MATERIALS else dict(at, bridge_masonry=fm_)
             if is_ml:
                 at = dict(at, ml=True)          # (_ml_steep once its ground is known)
+            elif on is None and mh <= 0.5:
+                lk = landmark_kind(ring, at, on_water=_on_water(ring.mean(0), water_xy))
+                if lk:
+                    at = dict(at, landmark=lk, ship_parts=funnels)
             attrs.append(at)
             looks.append(None)
             mins.append(mh)
