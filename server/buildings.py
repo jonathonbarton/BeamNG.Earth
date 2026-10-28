@@ -2240,7 +2240,9 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             rings.append(ring)
             mh = at.get("min_height")
             mh = float(mh) if mh is not None and np.isfinite(mh) and mh > 0 else 0.0
+            through = False
             if mh <= 0.5 and roads_xy and (road_through(ring, roads_xy) >= ROAD_THROUGH_M or road_across(ring, roads_xy)):
+                through = True
                 mh = OVER_ROAD_CLEAR_M
                 h = at.get("height")
                 if h is None or not np.isfinite(h) or h < mh + 3.0:
@@ -2261,7 +2263,14 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             on = _on_support(ring, supports)
             if on is not None:              # a bridge's own: no flats' windows (Tower Bridge's towers, the user 2026-10-18)
                 fm_ = str(at.get("facade_material") or "").lower()
-                at = dict(at, bridge_part=on) if fm_ in STEEL_MATERIALS else dict(at, bridge_masonry=fm_)
+                if through:
+                    # a tower the deck runs through (25 de Abril's pylons: building, bridge:support=pylon, 190 m) was
+                    # a solid block with a tunnel for the road, 2026-10-28: an open frame on the ground, the decks
+                    # between its legs
+                    at = dict(at, **{"class": "bridge_structure"}, facade_color=at.get("facade_color"))
+                    mh = 0.0
+                else:
+                    at = dict(at, bridge_part=on) if fm_ in STEEL_MATERIALS else dict(at, bridge_masonry=fm_)
             if is_ml:
                 at = dict(at, ml=True)          # (_ml_steep once its ground is known)
             attrs.append(at)
