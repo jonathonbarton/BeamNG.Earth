@@ -2552,7 +2552,8 @@ def _wing_lines(lay, ring=None):
             cs = flat_bays_cross_modules(lay)
             K = len(cs) - 1
             for k, c in enumerate(cs):
-                for dirn in ((1,) if k < K else ()) + ((-1,) if k > 0 else ()):
+                outer = (k == 0 and c - vp >= lay.s0 - 1e-6) or (k == K and c + vp <= lay.s1 + 1e-6)
+                for dirn in ((1,) if k < K or outer else ()) + ((-1,) if k > 0 or outer else ()):
                     clear = PAINT_CLEAR_M if 0 < k < K else 0.2
                     d = e + side * aw
                     while side * (far - (d + side * wp)) > 0.6:
@@ -2670,9 +2671,20 @@ PAINT_LIFT_M = 0.01         # m over the slab (roadmesh.DECK_SKIN)
 PAINT_TL_M = 6.4            # m of texture along (roads.EDGE_LINE)
 PAINT_CLEAR_M = 0.65        # stall lines start this far in from a module line (the columns: 0.25 half width there,
                             # perimeter columns 0.35 + 0.25 in from the outline; parapets 0.15 + 0.1)
+PAINT_WALL_CLEAR_M = 0.2    # m: paint stays this far inside the outline (the parapet's 0.1 inner half and the line)
+PAINT_MIN_LINE_M = 1.0      # m: a stall line clipped shorter than this by a wall is dropped
 ARROW_LEN_M = 3.0           # one-way aisles: an arrow down the aisle's centre ...
 ARROW_HEAD_M = 1.0          # ... its head strokes this long ...
 ARROW_EVERY_M = 20.0        # ... about this far apart
+
+
+def _ring_dist(ring, x):
+    """Distance from point x to the ring's nearest edge."""
+    a = np.asarray(ring, np.float64)
+    b = np.roll(a, -1, axis=0)
+    ab = b - a
+    t = np.clip(((x - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-12), 0.0, 1.0)
+    return float(np.hypot(*(a + ab * t[:, None] - x).T).min())
 
 
 def garage_paint(ring, lay):
@@ -2696,8 +2708,18 @@ def garage_paint(ring, lay):
         sp, sq = float((p - lay.A) @ lay.u), float((q - lay.A) @ lay.u)
         if min(sp, sq) < lay.s0 - 1e-6 or max(sp, sq) > lay.s1 + 1e-6:
             return                                  # (an angled row's last lines: not out into an end bay)
-        if _inside(ring, p) and _inside(ring, q) and _inside(ring, (p + q) / 2):
-            out.append((p, q, floors))
+        if not _inside(ring, p) or _ring_dist(ring, p) < PAINT_WALL_CLEAR_M:
+            return
+        L = float(np.hypot(*(q - p)))
+        n_ = max(2, int(L / 0.25) + 1)
+        last = 0.0
+        for t in np.linspace(0.0, 1.0, n_):         # clipped where it would cross a notched wall
+            x = p + (q - p) * t
+            if not _inside(ring, x) or _ring_dist(ring, x) < PAINT_WALL_CLEAR_M:
+                break
+            last = t
+        if last * L >= PAINT_MIN_LINE_M:
+            out.append((p, p + (q - p) * last, floors))
 
     if lay.scheme == "flat_bays":                   # the wings: rows across (or along the wall), every floor
         for p, q in _wing_lines(lay, ring)[0]:

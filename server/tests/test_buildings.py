@@ -496,6 +496,16 @@ class ParkingDeckTest(unittest.TestCase):
         for c0, c1, e0, e1 in cross:
             s_, d_ = (cols - lay.A) @ lay.u, (cols - lay.A) @ lay.n
             self.assertFalse(np.any((s_ > c0 - 0.25) & (s_ < c1 + 0.25) & (d_ > e0) & (d_ < e1)), "a column in a cross aisle")
+        cs = bld.flat_bays_cross_modules(lay)
+        if cs[0] - lay.dims[2] >= lay.s0:
+            self.assertTrue(any(abs(float((q - lay.A) @ lay.u) - (cs[0] - lay.dims[2])) < 0.05
+                                for p, q, _ in paint), "the end module double-loaded")
+        notched = np.array([(0, 0), (120, 0), (120, 70), (80, 70), (80, 64), (70, 64), (70, 70), (0, 70)], np.float64)
+        lay = bld._garage_layout(notched, storey, 3, 0.5, schemes=("flat_bays",))
+        for p, q, _ in bld.garage_paint(notched, lay):          # a notched wall: lines clipped clear of it
+            for t in np.linspace(0, 1, 9):
+                x = p + (q - p) * t
+                self.assertTrue(bld._inside(notched, x) and bld._ring_dist(notched, x) >= bld.PAINT_WALL_CLEAR_M - 1e-6)
         ring, floors, storey, lay = self.forced("flat_bays", 160, 55, 3)
         self.assertEqual([k for *_, k in bld.flat_bays_wings(lay)], ["row"], "1740's one wing: a spine and a row")
 
@@ -604,6 +614,10 @@ class ParkingDeckTest(unittest.TestCase):
                     levels.add(round(max(under), 2))
                 self.assertGreater(len(levels), floors, "every level painted")
                 self.assertAlmostEqual(Pp[:, 2].max() - bld.PAINT_LIFT_M, zs[-1], delta=0.3, msg="the top deck (double-threaded: its last ramp up to it)")
+                for p, q, _ in lines:                               # inside the outline less the parapet
+                    for t in np.linspace(0, 1, 9):
+                        x = p + (q - p) * t
+                        self.assertTrue(bld._inside(ring, x) and bld._ring_dist(ring, x) >= bld.PAINT_WALL_CLEAR_M - 1e-6)
                 cols = np.array(bld.module_columns(ring, lay))
                 for p, q, _ in lines:
                     for x in (p, q):
