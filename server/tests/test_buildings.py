@@ -404,8 +404,8 @@ class ParkingDeckTest(unittest.TestCase):
         self.assertEqual((floors, storey), (4, bld.STOREY_STD_M))
         self.assertAlmostEqual(lay.mw, bld.CCDC_LAYOUT[(lay.ucf, lay.angle)][1])
         self.assertLessEqual(lay.grade, bld.PARK_RAMP_MAX + 1e-9)
-        self.assertGreaterEqual(lay.s0, lay.mw - 1e-9, "a module-long end bay to turn in at A ...")
-        self.assertGreaterEqual(lay.L - lay.s1, lay.mw - 1e-9, "... and at B")
+        self.assertGreaterEqual(lay.s0, (bld.SPEED_END_M if lay.scheme == "flat_bays" else lay.mw) - 1e-9, "an end bay to turn in at A ...")
+        self.assertGreaterEqual(lay.L - lay.s1, (bld.SPEED_END_M if lay.scheme == "flat_bays" else lay.mw) - 1e-9, "... and at B")
         self.assertAlmostEqual(lay.L, 110.0)
         self.assertEqual(bld.deck_plan(spec, 0.0, 0.0)[3].scheme, lay.scheme, "the same garage, the same layout")
 
@@ -419,8 +419,9 @@ class ParkingDeckTest(unittest.TestCase):
                 if lay.angle == 90:
                     continue
                 self.assertIn(lay.angle, bld.CCDC_ONE_WAY_ANGLES)
-                self.assertIn(lay.scheme, ("both_bays", "double_thread"), "p.20: one-way never at 90, angled one-way")
-        self.assertGreaterEqual(len({s for s, _ in seen}), 4, seen)
+                self.assertIn(lay.scheme, ("both_bays",), "p.20: one-way never at 90, angled one-way")
+        self.assertGreaterEqual(len({s for s, _ in seen}), 2, seen)
+        self.assertIn(("flat_bays", 90), seen)
         self.assertTrue(any(a != 90 for _, a in seen) and any(a == 90 for _, a in seen), seen)
 
     def test_every_scheme_closed_drivable_with_headroom(self):
@@ -452,8 +453,34 @@ class ParkingDeckTest(unittest.TestCase):
                     # headroom over every point of the strip: the 8'-2" clear and the slab
                     for s in np.linspace(lay.s0 + 0.5, lay.s1 - 0.5, 5):
                         zz = self.surfaces(P, T, *at(s, dm))
-                        gaps = np.diff([z for z in zz if z > 0.031])         # (the ground deck runs on under the first ramp)
+                        gaps = np.diff(zz)
                         self.assertTrue(np.all(gaps >= bld.CLEAR_M + bld.DECK_SLAB_M - 1e-3), (scheme, s, zz))
+
+    def test_flat_bays_drive(self):
+        # Jon 2026-10-28 (1740 Technology Dr, San Jose): up a ramp, left onto the level deck or right up the next;
+        # down: left down again or right to the deck. Two ramps side by side, opposite ways, flat bays outside.
+        for floors, d in ((1, 90), (2, 40), (5, 60), (3, 160), (5, 140)):
+            ring, floors, storey, lay = self.forced("flat_bays", 160, d, floors)
+            kinds = [sl is None for _, _, sl in lay.strips]
+            wb = (lay.modules - 2) // 2
+            want = [True] * wb + [False, False] + [True] * (lay.modules - 2 - wb)
+            self.assertEqual(kinds, want, "wings round the ramp pair")
+            jb = kinds.index(False)
+            (_, _, b), (_, _, a) = lay.strips[jb], lay.strips[jb + 1]
+            self.assertTrue(all(hb > ha for ha, hb in a) and all(hb < ha for ha, hb in b), "opposite ways")
+            self.assertTrue(all(h % 2 == 0 for h in lay.west + lay.east + lay.flat), "whole floors only")
+            zs, (P, UV, T, M, C) = self.module_floors((ring, floors, storey, lay))
+            self.assertEqual(self.unbalanced(P, T), 0)
+            self.assertEqual(drive_check(P, T, lay, storey), [])
+            ups = [s for s in bld.garage_drive(lay) if s[0] == "up"]
+            self.assertEqual(len(ups), floors, "one ramp per storey, a single loop")
+
+    def test_flat_bays_preferred_where_it_fits(self):
+        for k in range(10):
+            _, (_, _, _, lay) = self.module_garage(160, 90, 15.2, x=k * 400.0)
+            self.assertEqual(lay.scheme, "flat_bays")
+        _, (_, _, _, lay) = self.module_garage(160, 40, 15.2)
+        self.assertEqual(lay.scheme, "flat_bays", "two modules: the bare ramp pair")
 
     def test_speed_ramp_has_transitions(self):
         # p.18: a ramp of 8 % or more gets 10' transitions at half its grade at both ends
@@ -469,7 +496,7 @@ class ParkingDeckTest(unittest.TestCase):
         self.assertLessEqual(lay.grade, bld.SPEED_RAMP_MAX2)
 
     def test_columns_on_module_lines_never_in_aisles(self):
-        for scheme in ("one_bay", "two_ramps", "both_bays", "double_thread"):
+        for scheme in ("flat_bays", "one_bay", "two_ramps", "both_bays"):
             with self.subTest(scheme=scheme):
                 ring, floors, storey, lay = self.forced(scheme, 160, 80)
                 cols = np.array(bld.module_columns(ring, lay))
@@ -553,10 +580,10 @@ class ParkingDeckTest(unittest.TestCase):
                         self.assertFalse(any(a0 + 1e-6 < d < a1 - 1e-6 for a0, a1 in aisles), "not in an aisle")
 
     def test_one_way_garage_gets_arrows(self):
-        ring, floors, storey, lay = self.forced("double_thread")
+        ring, floors, storey, lay = self.forced("both_bays")
         if lay.angle == 90:
             for k in range(20):
-                lay = bld._garage_layout(ring, storey, floors, k / 20 + 0.01, schemes=("double_thread",))
+                lay = bld._garage_layout(ring, storey, floors, k / 20 + 0.01, schemes=("both_bays",))
                 if lay.angle != 90:
                     break
         self.assertNotEqual(lay.angle, 90)
@@ -582,6 +609,59 @@ class ParkingDeckTest(unittest.TestCase):
         p = bld.deck_plan(spec, 0.0, 0.0)
         self.assertIsNotNone(p)
         self.assertEqual(p[1], 7)
+
+
+def drive_check(P, T, lay, storey, z0=0.03):
+    """Drive a flat_bays garage (bld.garage_drive) on its drawn mesh: [problem] (empty: drivable). Up from the ground
+    to the top deck and back down; at each ramp end the left/right turn is checked (up: left a flat bay at that floor,
+    right the next ramp up; down: left the next ramp down, right the flat bay), every floor reached, grades within
+    PARK_RAMP_MAX, 8'-2" + slab over every ramp."""
+    sf = ParkingDeckTest.surfaces
+    zh = bld.garage_levels(lay, storey, z0)
+    at = lambda s, d: lay.A + lay.u * s + lay.n * d
+    mid = lambda j: (lay.strips[j][0] + lay.strips[j][1]) / 2
+    has = lambda x, z: any(abs(v - round(z, 4)) < 2e-3 for v in sf(P, T, *x))
+    steps = bld.garage_drive(lay)
+    bad, floors_seen = [], {0}
+    if not steps:
+        return ["no drive"]
+    for k, (way, j, ha, hb, head, left, right) in enumerate(steps):
+        za, zb = zh(ha), zh(hb)
+        s_from, s_to = (lay.s0, lay.s1) if head > 0 else (lay.s1, lay.s0)
+        g = abs(zb - za) / (lay.s1 - lay.s0)
+        if g > bld.PARK_RAMP_MAX + 1e-9:
+            bad.append(f"step {k}: grade {g:.3f}")
+        for f in np.linspace(0.02, 0.98, 7):
+            s = s_from + (s_to - s_from) * f
+            zz = sf(P, T, *at(s, mid(j)))
+            z = za + (zb - za) * f
+            if not any(abs(v - z) < 0.02 for v in zz):
+                bad.append(f"step {k}: no ramp at {f:.2f}")
+            over = [v for v in zz if v > z + 0.05]
+            if over and min(over) - z < bld.CLEAR_M + bld.DECK_SLAB_M - 1e-3:
+                bad.append(f"step {k}: headroom {min(over) - z:.2f}")
+        end = s_to + head * 1.0                         # into the end aisle
+        if not has(at(end, mid(j)), zb):
+            bad.append(f"step {k}: no end aisle at {hb}")
+        flat_side, ramp_side = (left, right) if way == "up" else (right, left)
+        if not (0 <= flat_side < len(lay.strips)):
+            pass                                        # (no wing that side: the wall)
+        elif lay.strips[flat_side][2] is not None:
+            bad.append(f"step {k} {way}: {'left' if way == 'up' else 'right'} is not a flat bay")
+        elif not (has(at(end, mid(flat_side)), zb) and has(at(s_to - head * 3.0, mid(flat_side)), zb)):
+            bad.append(f"step {k}: flat bay not level with the end aisle at {hb}")
+        nxt = steps[k + 1] if k + 1 < len(steps) else None
+        if nxt and nxt[0] == way and nxt[1] != ramp_side:
+            bad.append(f"step {k} {way}: next ramp is not on the {'right' if way == 'up' else 'left'}")
+        if nxt and nxt[0] == way and nxt[4] == head:
+            bad.append(f"step {k}: next ramp runs the same way (not a U-turn)")
+        floors_seen.add(hb // 2)
+    top = max(h for _, _, a, b, *_ in steps for h in (a, b))
+    if floors_seen != set(range(top // 2 + 1)):
+        bad.append(f"floors reached {sorted(floors_seen)}")
+    if steps[-1][3] != 0:
+        bad.append("not back down to the ground")
+    return bad
 
 
 class SplitTest(unittest.TestCase):
