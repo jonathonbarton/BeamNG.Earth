@@ -117,6 +117,24 @@ class SignTagsTest(unittest.TestCase):
         self.assertEqual(miles, [21, 22, 23, 24])
         self.assertEqual({r["k"] for r in rows}, {"mile"})
 
+    def test_unsigned_link_is_signed_with_the_other_road_it_reaches(self):
+        """build_sign_tags' second pass keeps the name of a named road through a link end; exits() hands it to
+        index_records, so a link with no destination tags gets the road it reaches (a source='target' label)."""
+        main, links, junctions, places = tiny_network()
+        links = [(20, links[0][1], {"highway": "motorway_link", "oneway": "yes"})]
+        self.assertEqual(builder.link_ends(links).tolist(), [3, 5])
+        others = {}
+        builder._other_road(others, {"highway": "service", "name": "Lot"}, [5], {3, 5})
+        builder._other_road(others, {"highway": "primary", "name": "Morrison Bridge"}, [9, 5], {3, 5})
+        builder._other_road(others, {"highway": "primary", "name": "Later"}, [5], {3, 5})
+        builder._other_road(others, {"highway": "primary"}, [3], {3, 5})
+        self.assertEqual(others, {5: {"name": "Morrison Bridge"}})
+        found = builder.exits(main, links, junctions, {}, places, others)
+        self.assertEqual(len(found), 1)
+        self.assertIn("Morrison Bridge", str(found[0]["ways"][0]["label"]))
+        bare = builder.exits(main, links, junctions, {}, places)       # (without: the exit number only)
+        self.assertNotIn("Morrison Bridge", str(bare[0]["ways"][0]["label"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,6 +48,10 @@ MARGIN_DEG = 0.05           # mainline ways this far round an exit tile (latitud
 RAMP_KEEP_M = 320.0         # of a ramp: the gore search reads its first exitsigns.GORE_SEARCH_M
 SIMPLIFY_M = 0.5            # the paths' Douglas-Peucker tolerance
 MILE_PAD_DEG = 0.003        # milestones this far outside an Interstate's ways (osm_records' own bbox pad)
+# the roads a link can end on that are not freeways (exitsigns.index_records other_roads: an unsigned link is
+# signed with the road it reaches, e.g. a ramp onto the Morrison Bridge)
+OTHER = {"primary", "secondary", "tertiary", "unclassified", "residential", "living_street",
+         "primary_link", "secondary_link", "tertiary_link"}
 
 
 def _intern(cache, tags):
@@ -206,7 +210,56 @@ def _record(kind, oid, lon, lat, d):
     return {"id": int(oid), "k": kind, "lon": lon, "lat": lat, "d": d}
 
 
-def exits(main, links, junctions, relations, places):
+def link_ends(links):
+    """The end nodes of every link (np.int64, unique): where it can meet a road that is not a freeway."""
+    if not links:
+        return np.zeros(0, np.int64)
+    return np.unique(np.concatenate([[r[0], r[-1]] for _, r, _ in links]).astype(np.int64))
+
+
+def second_pass(src, ids, ends):
+    """One more read: the places of the ids (as build_rail_tags.second_pass) and {node id: {name, ref}} of the
+    named or numbered OTHER roads through a link end (np.int64 arrays)."""
+    with _rail()._Source(src) as f:
+        return _second_pass(f, ids, ends)
+
+
+def _second_pass(src, ids, ends):
+    import osmium
+    got_id, got_lon, got_lat, others, t0 = [], [], [], {}, time.time()
+    ends = set(ends.tolist())
+    fp = osmium.FileProcessor(src, osmium.osm.NODE | osmium.osm.WAY)
+    fp = fp.with_filter(osmium.filter.IdFilter(ids.tolist()).enable_for(osmium.osm.NODE))
+    fp = fp.with_filter(osmium.filter.KeyFilter("highway").enable_for(osmium.osm.WAY))
+    for o in fp:
+        if o.is_node():
+            if o.location.valid():
+                got_id.append(o.id)
+                got_lon.append(o.location.lon)
+                got_lat.append(o.location.lat)
+            continue
+        _other_road(others, o.tags, (n.ref for n in o.nodes), ends)
+    print(f"  pass 2: {len(got_id):,} node places, {len(others):,} link ends on other roads, "
+          f"{time.time() - t0:.0f} s", flush=True)
+    i = np.asarray(got_id, np.int64)
+    k = np.argsort(i)
+    return (i[k], np.asarray(got_lon, np.float64)[k], np.asarray(got_lat, np.float64)[k]), others
+
+
+def _other_road(others, tags, refs, ends):
+    """Record the way's name / ref at the link ends it passes (the first road seen at a node is kept: a
+    junction of two named roads keeps one, the way id order deciding)."""
+    if tags.get("highway") not in OTHER:
+        return
+    t = {k: tags[k] for k in ("name", "ref") if k in tags}
+    if not t:
+        return
+    for n in refs:
+        if n in ends and n not in others:
+            others[n] = t
+
+
+def exits(main, links, junctions, relations, places, others=None):
     """exitsigns.index_records per z7 tile of the links' first nodes, with the mainline ways near it."""
     groups = defaultdict(list)
     for row in links:
@@ -226,7 +279,7 @@ def exits(main, links, junctions, relations, places):
         part = [(w, r.tolist(), t) for w, r, t in part]
         refs = np.concatenate([np.asarray(r, np.int64) for _, r, _ in ways + part])
         coords = places.coords(refs)
-        found = exitsigns.index_records(ways, part, coords, junctions)
+        found = exitsigns.index_records(ways, part, coords, junctions, others)
         throughsigns.annotate_exits(found, relations)
         out += found
         if (i + 1) % 200 == 0:
@@ -331,9 +384,11 @@ def main():
           flush=True)
     ids = (np.unique(np.concatenate([r for _, r, _ in main_ways + links])) if main_ways or links
            else np.zeros(0, np.int64))
-    places = Places(*_rail().second_pass(a.second_pass or a.planet, ids))
-    print(f"pass 2: {len(places.nid):,} node places, {time.time() - t0:.0f} s", flush=True)
-    found = exits(main_ways, links, junctions, relations, places)
+    got, others = second_pass(a.second_pass or a.planet, ids, link_ends(links))
+    places = Places(*got)
+    print(f"pass 2: {len(places.nid):,} node places, {len(others):,} link ends on other roads, "
+          f"{time.time() - t0:.0f} s", flush=True)
+    found = exits(main_ways, links, junctions, relations, places, others)
     print(f"exits: {len(found):,}, {time.time() - t0:.0f} s", flush=True)
     over = through(main_ways, found, relations, places)
     print(f"overhead stations: {len(over):,}, {time.time() - t0:.0f} s", flush=True)
