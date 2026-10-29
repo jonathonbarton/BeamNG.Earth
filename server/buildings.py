@@ -1480,6 +1480,198 @@ def _deck_wall(m, p, q, z0, z1, mat, t=0.2):
         _box(m, (p + q) / 2, d / L, L / 2, t / 2, z0, z1, mat)
 
 
+# The parking-module garage (the user, 2026-10-28, a garage by Century Winchester in San Jose: "no room to turn",
+# "ramp far too narrow, a slot between tall walls", "gaps"): real garages are laid out in parking modules, each
+# | 90-degree bays 6 m | two traffic lanes | bays 6 m | about 19 m across, side by side; the ramp is one whole
+# module sloped from one storey to the next ("sloped floor" / split bay), between flat cross-aisle end bays at
+# least a module long where the cars turn round. Here: the module strip along one long outer edge slopes up from
+# end A (s0) to end B (s1) on every storey (the slabs parallel: a storey of headroom everywhere); a car comes up at
+# B, drives back along the flat module(s) beside it to A and takes the next one up (both lanes two-way).
+PARK_BAY_M = 6.0            # a 90-degree stall, its clearances included
+AISLE_LANE_M = 3.65         # a traffic lane of the module's aisle
+MODULE_M = 2 * PARK_BAY_M + 2 * AISLE_LANE_M      # 19.3 m: one parking module
+MODULE_END_M = MODULE_M     # m of flat end bay (the turn-round) at each end of the sloped module
+RAMP_GRADE = 0.067          # the steepest parking-in-ramp (sloped floor with stalls on it)
+RAMP_GRADE_MAX = 0.12       # a short garage's sloped module up to this (a drive ramp's grade, stalls or not)
+RAMP_PARAPET_IN_M = 0.15    # m the ramp's parapets stand in from its edges
+MERGE_COLLINEAR_M = 0.6     # m off the line through its neighbours a vertex may be and still be dropped
+
+
+class ModuleLayout(tuple):
+    """(edge i, A, along u, inward n, s0, s1, edge length, modules deep, grade): the sloped module along ring
+    edge i, from s0 to s1 (arc length from A), MODULE_M deep; the ring holds `modules` whole modules inward."""
+    __slots__ = ()
+
+    def __new__(cls, *v):
+        return super().__new__(cls, v)
+
+    i = property(lambda t: t[0])
+    A = property(lambda t: t[1])
+    u = property(lambda t: t[2])
+    n = property(lambda t: t[3])
+    s0 = property(lambda t: t[4])
+    s1 = property(lambda t: t[5])
+    L = property(lambda t: t[6])
+    modules = property(lambda t: t[7])
+    grade = property(lambda t: t[8])
+
+
+def _merge_collinear(ring, tol=MERGE_COLLINEAR_M):
+    """The ring without vertices within tol of the line through their neighbours (a mapped outline's long wall is
+    often several edges: the Winchester garage's 111 m north wall was 39 + 61 m)."""
+    pts = [np.asarray(p, np.float64) for p in ring]
+    changed = True
+    while changed and len(pts) > 3:
+        changed = False
+        for k in range(len(pts)):
+            a, p, b = pts[k - 1], pts[k], pts[(k + 1) % len(pts)]
+            ab = b - a
+            L = float(np.hypot(*ab))
+            if L < 1e-9:
+                del pts[k]
+                changed = True
+                break
+            off = abs(float(ab[0] * (p - a)[1] - ab[1] * (p - a)[0])) / L
+            if off < tol and 0.0 <= float((p - a) @ ab) <= L * L:
+                del pts[k]
+                changed = True
+                break
+    return np.array(pts)
+
+
+def _module_layout(ring, storey):
+    """ModuleLayout of the counter-clockwise ring, or None: the edge (longest first) along which two whole modules
+    (the sloped one and a flat one to come back along) and a MODULE_END_M end bay at each end fit inside the ring,
+    with the sloped run no steeper than RAMP_GRADE on any edge, else RAMP_GRADE_MAX."""
+    k_ring = len(ring)
+    lens = [float(np.hypot(*(ring[(k + 1) % k_ring] - ring[k]))) for k in range(k_ring)]
+    order = sorted(range(k_ring), key=lambda k: -lens[k])
+    for cap in (RAMP_GRADE, RAMP_GRADE_MAX):
+        for i in order:
+            L = lens[i]
+            s0, s1 = MODULE_END_M, L - MODULE_END_M
+            if s1 - s0 <= 0 or storey / (s1 - s0) > cap + 1e-9:
+                break                           # (the rest are shorter)
+            a = ring[i]
+            u = (ring[(i + 1) % k_ring] - a) / L
+            n = np.array([-u[1], u[0]])         # the inside is on the left
+            mods = 0
+            while mods < 8 and all(_inside(ring, a + u * s + n * d)
+                                   for s in np.linspace(0.6, L - 0.6, max(9, int(L // 6)))
+                                   for d in np.linspace(mods * MODULE_M + 0.6, (mods + 1) * MODULE_M - 0.3, 5)):
+                mods += 1
+            if mods >= 2:
+                return ModuleLayout(i, a, u, n, s0, s1, L, mods, storey / (s1 - s0))
+    return None
+
+
+def _slab(m, top, thick, mat, uvp):
+    """A closed slab: the planar polygon top ((k, 3), counter-clockwise from above) facing up, the same thick lower
+    facing down, a side quad per edge (each edge shared by exactly two of its triangles)."""
+    top = [tuple(float(c) for c in p) for p in top]
+    bot = [(x, y, z - thick) for x, y, z in top]
+    m.poly(top, [uvp(p) for p in top], mat)
+    m.poly(bot[::-1], [uvp(p) for p in bot[::-1]], mat)
+    for j in range(len(top)):
+        k = (j + 1) % len(top)
+        m.quad(bot[j], bot[k], top[k], top[j], (0, 0), (1, 0), (1, 0.1), (0, 0.1), mat)
+
+
+def _sloped_wall(m, p, q, zp, zq, h, mat, t=0.2, sink=0.1):
+    """A closed wall from p (ground zp) to q (zq), h over that line and sink under it, t thick: a parapet along a
+    ramp (its top follows the ramp)."""
+    d = q - p
+    L = float(np.hypot(*d))
+    if L < 0.05:
+        return
+    v = np.array([-d[1], d[0]]) / L * (t / 2)
+    c = [p - v, q - v, q + v, p + v]           # counter-clockwise from above
+    zb = [zp - sink, zq - sink, zq - sink, zp - sink]
+    zt = [zp + h, zq + h, zq + h, zp + h]
+    uv = ((0.002, 0.995), (0.012, 0.995), (0.012, 0.999), (0.002, 0.999))
+    for j in range(4):
+        k = (j + 1) % 4
+        m.quad((*c[j], zb[j]), (*c[k], zb[k]), (*c[k], zt[k]), (*c[j], zt[j]), *uv, mat)
+    m.quad(*[(*c[j], zt[j]) for j in range(4)], *uv, mat)
+    m.quad(*[(*c[j], zb[j]) for j in (3, 2, 1, 0)], *uv, mat)
+
+
+def _module_floors(m, ring, floors, storey, lay, z0, mat, uvp):
+    """The drivable structure of a module garage (closed slabs and parapets): the ground deck, decks 1..floors
+    with the sloped module's strip cut out between its end bays, one sloped slab per storey in that strip, low
+    parapets. Returns the decks' heights."""
+    i, A, u, n, s0, s1 = lay[:6]
+    D = MODULE_M
+    k_ring = len(ring)
+    zs = [z0 + k * storey for k in range(floors + 1)]
+
+    def at(s, d):
+        return A + u * s + n * d
+
+    _slab(m, [(p[0], p[1], zs[0]) for p in ring], DECK_SLAB_M, mat, uvp)
+    well = [at(s0, 0.0), at(s0, D), at(s1, D), at(s1, 0.0)]
+    pts = [A] + well + [ring[(i + 1 + j) % k_ring] for j in range(k_ring - 1)]
+    for k in range(1, floors + 1):
+        z = zs[k]
+        _slab(m, [(p[0], p[1], z) for p in pts], DECK_SLAB_M, mat, uvp)
+        for j in range(len(pts)):
+            if not (1 <= j <= 3):               # round the outline (the well's edges below)
+                _sloped_wall(m, pts[j], pts[(j + 1) % len(pts)], z, z, DECK_PARAPET_M, mat)
+        if k == floors:                         # nothing leaves the top deck: the drop to the last ramp's foot
+            _sloped_wall(m, at(s0 - 0.1, 0.0), at(s0 - 0.1, D), z, z, DECK_PARAPET_M, mat)
+    for k in range(floors + 1):                 # the flat module's edge along the sloped one, every deck
+        _sloped_wall(m, at(s0, D + 0.1), at(s1, D + 0.1), zs[k], zs[k], DECK_PARAPET_M, mat)
+    for k in range(floors):                     # the sloped module: s0 at deck k up to s1 at deck k + 1
+        za, zb = zs[k], zs[k + 1]
+        _slab(m, [(*at(s0, 0.0), za), (*at(s1, 0.0), zb), (*at(s1, D), zb), (*at(s0, D), za)], DECK_SLAB_M, mat, uvp)
+        for d in (RAMP_PARAPET_IN_M, D - RAMP_PARAPET_IN_M):
+            _sloped_wall(m, at(s0, d), at(s1, d), za, zb, DECK_PARAPET_M, mat)
+    return zs
+
+
+def _module_deck(m, spec, gmin, gmax, mat_idx, ring, floors, storey, lay):
+    """The module garage (see MODULE_M): its floors, skin, perimeter columns and interior columns on the module
+    lines between back-to-back stalls (never in a lane, none in the end bays where the cars turn)."""
+    mat = mat_idx[f"{PANEL}|{len(WALL_TINTS[PANEL]) - 1 - int(_hash01(spec.seed, 'deck') * 2)}"]
+
+    def uvp(p):
+        return (float(p[0]) / 4.0, float(p[1]) / 4.0)
+
+    k_ring = len(ring)
+    zs = _module_floors(m, ring, floors, storey, lay, gmax + 0.03, mat, uvp)
+    if gmax - gmin > 0.05:                      # the ground deck's plinth down to the lowest ground
+        for j in range(k_ring):
+            p, q = ring[j], ring[(j + 1) % k_ring]
+            m.quad((p[0], p[1], gmin - FOUNDATION_M), (q[0], q[1], gmin - FOUNDATION_M),
+                   (q[0], q[1], zs[0] - DECK_SLAB_M), (p[0], p[1], zs[0] - DECK_SLAB_M),
+                   (0, 0), (1, 0), (1, 0.1), (0, 0.1), mat)
+    _garage_skin(m, spec, ring, zs, lay.i, mat_idx)
+    for j in range(k_ring):                     # perimeter columns
+        p, q = ring[j], ring[(j + 1) % k_ring]
+        L = float(np.hypot(*(q - p)))
+        if L < 0.5:
+            continue
+        d = (q - p) / L
+        inward = np.array([-d[1], d[0]])
+        for t in np.arange(0.0, L, DECK_COLUMN_M):
+            _box(m, p + d * t + inward * 0.35, d, 0.25, 0.25, zs[0] - FOUNDATION_M, zs[-1], mat)
+    for c in module_columns(ring, lay):
+        _box(m, c, lay.u, 0.25, 0.25, zs[0] - FOUNDATION_M, zs[-1], mat)
+
+
+def module_columns(ring, lay):
+    """The interior columns' centres: on each line between modules (between back-to-back stalls), every
+    ~DECK_COLUMN_M from s0 to s1."""
+    out = []
+    nseg = max(1, int(round((lay.s1 - lay.s0) / DECK_COLUMN_M)))
+    for j in range(1, lay.modules):
+        for t in np.linspace(lay.s0, lay.s1, nseg + 1):
+            c = lay.A + lay.u * t + lay.n * (j * MODULE_M)
+            if _inside(ring, c):
+                out.append(c)
+    return out
+
+
 def deck_plan(spec, gmin, gmax):
     """(counter-clockwise ring, floors, storey height, _deck_layout) of a parking structure drawn as open decks, or
     None (not a garage, ground too uneven, storeys too low, the ramp does not fit: a closed box)."""
@@ -1495,7 +1687,11 @@ def deck_plan(spec, gmin, gmax):
     ring = np.asarray(spec.ring, np.float64)
     if _area2(ring) < 0:
         ring = ring[::-1]
-    lay = _deck_layout(ring, storey)
+    simple = _merge_collinear(ring)
+    mod = _module_layout(simple, storey)
+    if mod is not None:                         # parking modules, a whole one sloped (MODULE_M)
+        return simple, floors, storey, mod
+    lay = _deck_layout(ring, storey)            # too small for that: the two-lane switchback along one wall
     return None if lay is None else (ring, floors, storey, lay)
 
 
@@ -1504,6 +1700,9 @@ def _parking_deck(m, spec, gmin, gmax, mat_idx):
     plan_ = deck_plan(spec, gmin, gmax)
     if plan_ is None:
         return False
+    if isinstance(plan_[3], ModuleLayout):
+        _module_deck(m, spec, gmin, gmax, mat_idx, *plan_)
+        return True
     ring, floors, storey, (i, A, u, n, s0, s1) = plan_
     # weathered concrete (Baltimore's street photos: the white decks read as a skeleton; city garages are grey)
     mat = mat_idx[f"{PANEL}|{len(WALL_TINTS[PANEL]) - 1 - int(_hash01(spec.seed, 'deck') * 2)}"]

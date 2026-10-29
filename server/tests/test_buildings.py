@@ -333,6 +333,107 @@ class ParkingDeckTest(unittest.TestCase):
         self.assertTrue(bld._covers_garage(rect(0, 0, 100, 100), [rect(40, 40, 10, 10)]))
         self.assertFalse(bld._covers_garage(r, [rect(200, 0, 60, 40)]))
 
+    @staticmethod
+    def unbalanced(P, T, q=1e-3):
+        """Edges (welded within q) not matched by as many reverse edges: 0 for a closed, outward-oriented surface."""
+        _, vid = np.unique(np.round(P / q).astype(np.int64), axis=0, return_inverse=True)
+        t = vid.ravel()[T]
+        e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
+        e = e[e[:, 0] != e[:, 1]]
+        cnt = {}
+        for a, b in map(tuple, e.tolist()):
+            cnt[(a, b)] = cnt.get((a, b), 0) + 1
+        return sum(1 for (a, b), v in cnt.items() if cnt.get((b, a), 0) != v)
+
+    def module_garage(self, w=110, d=60, floors=4, h=12.4):
+        spec = bld.plan(rect(0, 0, w, d), {"class": "parking", "num_floors": floors, "height": h}, 0, 37.32, -121.95)
+        return spec, bld.deck_plan(spec, 0.0, 0.0)
+
+    def module_floors(self, spec, plan_, z0=0.03):
+        ring, floors, storey, lay = plan_
+        m = bld.Mesh()
+        mat = bld._Looks(spec.seed)[f"{bld.PANEL}|0"]
+        zs = bld._module_floors(m, ring, floors, storey, lay, z0, mat, lambda p: (0.0, 0.0))
+        return zs, m.arrays()
+
+    def test_a_long_garage_is_parking_modules_with_a_sloped_one(self):
+        # the user, 2026-10-28 (San Jose, by Century Winchester): no room to turn, a narrow slot, gaps
+        spec, (ring, floors, storey, lay) = self.module_garage()
+        self.assertIsInstance(lay, bld.ModuleLayout)
+        self.assertGreaterEqual(bld.MODULE_M, 19.0, "two 6 m stall rows and two lanes")
+        self.assertLessEqual(lay.grade, bld.RAMP_GRADE + 1e-9)
+        self.assertAlmostEqual(lay.grade, storey / (lay.s1 - lay.s0))
+        self.assertGreaterEqual(lay.s0, bld.MODULE_M - 1e-9, "a module-long end bay to turn in at A ...")
+        self.assertGreaterEqual(lay.L - lay.s1, bld.MODULE_M - 1e-9, "... and at B")
+        self.assertEqual(lay.modules, 3)
+        self.assertAlmostEqual(lay.L, 110.0)
+
+    def test_module_ramp_is_closed_drivable_and_meets_the_decks(self):
+        spec, plan_ = self.module_garage()
+        ring, floors, storey, lay = plan_
+        zs, (P, UV, T, M, C) = self.module_floors(spec, plan_)
+        self.assertEqual(self.unbalanced(P, T), 0, "every slab and parapet closed: no gaps or holes")
+        tri = P[T]
+        n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        up = n[:, 2] / np.maximum(np.linalg.norm(n, axis=1), 1e-9)
+        sloped = (up > 0.99) & (up < 0.99999)
+        self.assertGreaterEqual(int(sloped.sum()), 2 * floors, "a sloped top per storey")
+        slope = np.sqrt(1 - up[sloped] ** 2) / up[sloped]
+        self.assertTrue(np.all(slope <= bld.RAMP_GRADE + 1e-6), slope.max())
+        # the sloped module's top at its feet and heads is exactly a deck's corner (no step, no gap)
+        at = lambda s, d: lay.A + lay.u * s + lay.n * d
+        corners = {tuple(v) for v in np.round(P, 3).tolist()}
+        for k in range(floors):
+            for s, z in ((lay.s0, zs[k]), (lay.s1, zs[k + 1])):
+                for d in (0.0, bld.MODULE_M):
+                    self.assertIn(tuple(np.round([*at(s, d), z], 3).tolist()), corners)
+
+    def test_module_parapets_are_low_and_columns_miss_the_lanes(self):
+        spec, plan_ = self.module_garage()
+        ring, floors, storey, lay = plan_
+        zs, (P, UV, T, M, C) = self.module_floors(spec, plan_, 0.0)
+        self.assertLessEqual(P[:, 2].max(), zs[-1] + bld.DECK_PARAPET_M + 1e-6, "no wall over a parapet's height")
+        rel = P[:, :2] - lay.A
+        d, s = rel @ lay.n, rel @ lay.u
+        inside = (s > lay.s0 + 0.5) & (s < lay.s1 - 0.5) & (d > 0.5) & (d < bld.MODULE_M - 0.5)
+        self.assertFalse(inside.any(), "no wall across the sloped module's width: its lanes and stalls open")
+        cols = np.array(bld.module_columns(ring, lay))
+        self.assertGreater(len(cols), 0)
+        frac = np.mod((cols - lay.A) @ lay.n, bld.MODULE_M)
+        self.assertTrue(np.all(np.minimum(frac, bld.MODULE_M - frac) < 0.01), "on the lines between stall rows")
+        cs = (cols - lay.A) @ lay.u
+        self.assertTrue(np.all((cs >= lay.s0 - 1e-6) & (cs <= lay.s1 + 1e-6)), "none in the end bays")
+
+    def test_module_garage_collides_as_drawn(self):
+        spec, plan_ = self.module_garage()
+        P, UV, T, M, mats, C = bld.build([(spec, 0.0, 0.0)])
+        Pc, _, Tc = bld.collision_mesh([(spec, 0.0, 0.0)])[:3]
+
+        def sloped_tops(P, T):
+            tri = P[T]
+            n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            up = n[:, 2] / np.maximum(np.linalg.norm(n, axis=1), 1e-9)
+            return sorted(map(tuple, np.round(tri[(up > 0.99) & (up < 0.99999)].reshape(-1, 9), 3).tolist()))
+        self.assertTrue(sloped_tops(P, T))
+        self.assertEqual(sloped_tops(P, T), sloped_tops(Pc, Tc), "the ramps' collision is the drawn one")
+        self.assertEqual(bld.collider_boxes([(spec, 0.0, 0.0)], 0, 0), [], "driven into: no keep-out box")
+
+    def test_short_garage_steeper_module_then_switchback(self):
+        # 70 m: a 31 m run, 9.7 % for 3 m storeys (over the parking grade, under RAMP_GRADE_MAX)
+        _, (_, _, storey, lay) = self.module_garage(70, 45, 3, 9.0)
+        self.assertIsInstance(lay, bld.ModuleLayout)
+        self.assertGreater(lay.grade, bld.RAMP_GRADE)
+        self.assertLessEqual(lay.grade, bld.RAMP_GRADE_MAX)
+        # too narrow for two modules, or too short: the switchback along one wall as before
+        _, (_, _, _, lay) = self.module_garage(60, 30, 3, 9.0)
+        self.assertNotIsInstance(lay, bld.ModuleLayout)
+        _, (_, _, _, lay) = self.module_garage(60, 40, 3, 9.0)
+        self.assertNotIsInstance(lay, bld.ModuleLayout)
+
+    def test_collinear_outline_points_merge(self):
+        r = np.array([(0, 0), (40, 0.2), (110, 0), (110, 60), (50, 60.3), (0, 60)], np.float64)
+        self.assertEqual(len(bld._merge_collinear(r)), 4)
+
     def test_split_levels_counted_as_floors_still_make_decks(self):
         spec = bld.plan(rect(0, 0, 60, 40), {"class": "parking", "num_floors": 10, "height": 20.8}, 0, 39.28, -76.59)
         p = bld.deck_plan(spec, 0.0, 0.0)
