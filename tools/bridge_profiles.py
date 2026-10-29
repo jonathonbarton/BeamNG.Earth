@@ -62,6 +62,8 @@ CASES = {
                   dict(deck_m=43, src="Wikipedia: clearance 135 ft (41 m) + ~2 m", art="truss")),
     "skyway": ("Sunshine Skyway, Tampa Bay FL", 27.6235, -82.6553, ["skyway"],
                dict(deck_m=58, src="Wikipedia: clearance 180 ft (55 m) + ~3 m", art="cable-stayed")),
+    "erasmus": ("Erasmusbrug, Rotterdam NL", 51.9093, 4.4868, ["erasmus"],
+                dict(deck_m=12, src="Rijkswaterstaat FIS: clearance 10.1 m (closed) + ~2 m", art="cable-stayed")),
     "vincentthomas": ("Vincent Thomas Bridge, San Pedro CA", 33.7493, -118.2720, ["vincent thomas"],
                       dict(deck_m=58, src="Wikipedia: clearance 185 ft (56 m) + ~2 m", art="suspension")),
     "lbgateway": ("Long Beach International Gateway CA", 33.7648, -118.2213, ["gateway", "desmond"],
@@ -99,7 +101,7 @@ def run_case(key, md, dem, cache, mode):
     global _SEA
     if "_SEA" not in globals():
         import seacarve
-        _SEA = seacarve.SeaCarver(md, cache)
+        _SEA = seacarve.SeaCarver(md, cache, dem=dem)      # (with the DEM: rivers and lakes, as the server)
 
     def elev(la, lo):
         return _SEA.carve(la, lo, dem.sample(la, lo, zoom))
