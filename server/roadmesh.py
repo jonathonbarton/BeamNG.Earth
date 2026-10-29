@@ -22,7 +22,7 @@ import numpy as np
 import cdae
 
 DRAPE_STEP = 2.0        # m between ribbon cross-sections (the physics block's lattice)
-LIFT = {"base": 0.0, "gutter": 0.005, "mark": 0.01}   # m above the physics ground (lifted under roads
+LIFT = {"base": 0.0, "edge": 0.003, "gutter": 0.005, "mark": 0.01}   # m above the physics ground (lifted under roads
                                                         # by grading.ROAD_LIFT over the visible ground)
 
 
@@ -81,19 +81,39 @@ def ribbon_pairs(chunks):
 
 def ribbons(chunks):
     """Per chunk: (left (k, 2), right (k, 2), v (k,), material, layer, z (k,) or None) in the anchor
-    frame; z: the chunk's own heights where it is "fixed" (bridge decks), else None (draped). Pure."""
-    out = []
-    for c in chunks:
-        pts = np.asarray(c["n"], np.float64)
-        if len(pts) < 2:
+    frame; z: the chunk's own heights where it is "fixed" (bridge decks), else None (draped). Pure. The draped and
+    plain chunks' resampling and normals in one Rust call (earthfast.ribbon_edges: numpy per chunk was ~0.9 s of 8
+    city road tiles, 2026-10-28); a fixed deck's (its profile's knots kept) here."""
+    import fast
+    out = [None] * len(chunks)
+    batch, pts, half = [], [], []
+    for k, c in enumerate(chunks):
+        p = np.asarray(c["n"], np.float64)
+        if len(p) < 2:
             continue
-        xy, s, z = _resample(pts, DRAPE_STEP, keep_vertices=bool(c.get("deck") and c.get("fixed")))
-        if len(xy) < 2:
+        if c.get("deck") and c.get("fixed"):
+            xy, s, z = _resample(p, DRAPE_STEP, keep_vertices=True)
+            if len(xy) < 2:
+                continue
+            n = _normals(xy) * (float(c["w"]) / 2)
+            out[k] = (xy + n, xy - n, s / float(c.get("tl") or 10.0), c["m"], layer_of(c), z)
             continue
-        n = _normals(xy) * (float(c["w"]) / 2)
-        out.append((xy + n, xy - n, s / float(c.get("tl") or 10.0), c["m"], layer_of(c),
-                    z if c.get("fixed") else None))
-    return out
+        batch.append(k)
+        pts.append(p[:, :3])
+        half.append(float(c["w"]) / 2)
+    if batch:
+        fast.require(90, "ribbon_edges")
+        off = np.r_[0, np.cumsum([len(p) for p in pts])].astype(np.int64)
+        L, R, S, Z, o = fast._ef.ribbon_edges(np.ascontiguousarray(np.concatenate(pts)), off,
+                                             np.asarray(half, np.float64), float(DRAPE_STEP))
+        for n, k in enumerate(batch):
+            a, b = int(o[n]), int(o[n + 1])
+            if b - a < 2:
+                continue
+            c = chunks[k]
+            out[k] = (L[a:b], R[a:b], S[a:b] / float(c.get("tl") or 10.0), c["m"], layer_of(c),
+                      Z[a:b] if c.get("fixed") else None)
+    return [r for r in out if r is not None]
 
 
 TRIM_DZ = (0.3, 4.5)                # m: another deck overlapping a deck in plan this far above or below it (two
@@ -383,7 +403,8 @@ def build(frame, chunks, elev, origin, lift=0.0, clip=None, follow=False, q=None
         if c["m"] not in mats:
             mats.append(c["m"])
         P.append(np.c_[pq[:, :2], z])
-        UV.append(np.c_[pq[:, 0] / 8.0, pq[:, 1] / float(c.get("tl") or 10.0)])
+        UV.append(np.asarray(c["uvq"], np.float64) if c.get("uvq") is not None else       # (a decal sheet's cell:
+                  np.c_[pq[:, 0] / 8.0, pq[:, 1] / float(c.get("tl") or 10.0)])          # markings.arrow_quad)
         fan = np.array([(nverts, nverts + a, nverts + a + 1) for a in range(1, k - 1)])
         pts = np.c_[pq[:, :2], z]
         nrm = np.cross(pts[fan[:, 1] - nverts] - pts[fan[:, 0] - nverts], pts[fan[:, 2] - nverts] - pts[fan[:, 0] - nverts])
@@ -443,6 +464,8 @@ GIRDER_EVERY = 3.0      # m between girders across the deck
 PARAPET_W = 0.45        # m: the slab reaches this far past the road's edge, a parapet on it ...
 PARAPET_H = 0.84        # ... this high over the road (a jersey barrier's: JERSEY_H)
 PARAPET_COVER_DZ = 2.0  # m: another deck's surface within this height at an edge point: no parapet there
+BRIDGE_RAILS = True     # stock rail modules on decks with mapped support; unsupported decks keep full parapets
+BRIDGE_CURB_H = 0.3     # m curb under generated guardrails, only on decks supported by mapped data
 PARAPET_MIN_M = 8.0     # m: a parapet run shorter than this is left out (stubs stood in the Queensboro Bridge's lanes
                         # where its two directions' decks meet and the cover test missed a few points, 2026-10-17)
 MEDIAN_JOIN_M = 6.0     # m: two decks' edges closer than this (a divided road's carriageways on one bridge) face a
@@ -554,7 +577,8 @@ def barrier_solid(edge, inward, z, h, v=None, section=JERSEY):
     return P, T, UV
 
 
-def deck(chunks, origin, piers=(), context=(), beams=(), ground=()):
+def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=None, parapet_h=PARAPET_H,
+         low_parapet_decks=()):
     """The bridge decks of a tile as one colliding mesh: per "deck" chunk a slab of opaque concrete
     (DECK_SIDE) whose top is at the chunk's fixed heights (the road surface, drawn DECK_SKIN above it
     by build()), with sides and underside DECK_DEPTH below; the piers, and the truss beams (p, q, width, height:
@@ -566,6 +590,12 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=()):
     rb = trim_overlaps([(r, c) for r, c in ribbon_pairs(dch) if r[5] is not None], cr_all)
     if not rb and not piers and not beams:
         return None
+    low_parapet_decks = set(low_parapet_decks or ())
+    if parapets is None:
+        parapets = parapet_runs(chunks, context, _rb=rb, ground=ground)
+    parapets_by_deck = {}
+    for parapet in parapets:
+        parapets_by_deck.setdefault(parapet["deck"], []).append(parapet)
     mats, P, UV, T, M = [], [], [], [], []
     nv = 0
 
@@ -637,33 +667,17 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=()):
             quads(GL, GLb, 0.0, 0.1, v, v, side, out_l)
             quads(GR, GRb, 0.0, 0.1, v, v, side, -out_l)
             quads(GLb, GRb, 0.0, 0.05, v, v, side, np.array([0.0, 0.0, -1.0]))
-        # a parapet on each free edge (not where another deck goes on beside it: a ramp leaving, a carriageway)
-        for sgn, edge, inner, cov in ((1, el, left, covered[n][0]), (-1, er, right, covered[n][1])):
-            i = 0
-            while i < k:
-                if cov[i]:
-                    i += 1
-                    continue
-                j = i
-                while j + 1 < k and not cov[j + 1]:
-                    j += 1
-                run_len = float(np.hypot(*np.diff(edge[i:j + 1], axis=0).T).sum()) if j > i else 0.0
-                if j > i and (run_len >= PARAPET_MIN_M or i == 0 or j == k - 1):    # (a piece's ends: tile seams)
-                    sl = slice(i, j + 1)
-                    mid_ = (left + right) / 2
-                    ends = list(c.get("abut") or [])
-                    if i > 0:                                       # the run stops there (a gap, a gore)
-                        ends.append(tuple(mid_[i]))
-                    if j < k - 1:
-                        ends.append(tuple(mid_[j]))
-                    bp, bt_, buv = barrier_solid(edge[sl], -out_l[sl, :2] * sgn, z[sl],
-                                                 parapet_heights(mid_[sl], ends), v[sl])
-                    P.append(bp - origin)
-                    UV.append(buv)
-                    T.append(bt_ + nv)
-                    M.append(np.full(len(bt_), side))
-                    nv += len(bp)
-                i = j + 1
+        # a parapet on each free edge (parapet_runs: not where another deck goes on beside it, a ramp leaving, a
+        # carriageway); a low curb under the rail where mapped guard rails put stock rail modules on it (guardrails)
+        for parapet in parapets_by_deck.get(n, ()):
+            h = parapet_heights(parapet["mid"], parapet["ends"])
+            h = np.minimum(h, BRIDGE_CURB_H if BRIDGE_RAILS and n in low_parapet_decks else parapet_h)
+            bp, bt_, buv = barrier_solid(parapet["edge"], -parapet["out"], parapet["z"], h, parapet["v"])
+            P.append(bp - origin)
+            UV.append(buv)
+            T.append(bt_ + nv)
+            M.append(np.full(len(bt_), side))
+            nv += len(bp)
     for p in _piers_clear(piers, rb):
         _pier(p, origin, P, T, UV, M, side)
         nv = sum(len(a) for a in P)
@@ -873,6 +887,75 @@ def _parapet_cover(rb, context=()):
         k = len(z)
         out.append((cov[k0:k0 + k], cov[k0 + k:k0 + 2 * k]))
         k0 += 2 * k
+    return out
+
+
+
+def parapet_runs(chunks, context=(), _rb=None, ground=()):
+    """Actual generated bridge parapets as XY centre lines plus the mesh geometry.
+
+    Uses the same coverage masks, edge offsets, tunnel exclusion, and minimum-run rule as deck().
+    _rb lets deck() share its already-computed ribbons. Returned dictionaries are ordered by deck
+    chunk and edge, and include the points deck() uses verbatim.
+    """
+    if _rb is None:
+        dch = [c for c in chunks if c.get("deck")]
+        cr_all = [(r, c) for r, c in ribbon_pairs(list(context)) if r[5] is not None]
+        rb = trim_overlaps([(r, c) for r, c in ribbon_pairs(dch) if r[5] is not None], cr_all)
+    else:
+        rb = _rb
+    if not rb:
+        return []
+
+    cr = [r for r in ribbons(list(context)) if r[5] is not None]
+    cov_ctx = [(r, c) for r, c in zip(cr, context)] + _ground_carriageways(list(chunks) + list(ground))
+    covered = _parapet_cover([(r, c) for r, c in rb], cov_ctx)
+    medians = _median_gaps([(r, c) for r, c in rb],
+                           [(r, c) for r, c in zip(ribbons(list(context)), context) if r[5] is not None])
+    out = []
+    for n, ((left, right, v, _m, _layer, z), c) in enumerate(rb):
+        if c.get("tunnel"):       # deck() draws the tunnel floor without parapets
+            continue
+        lat = left - right
+        u = lat / np.maximum(np.hypot(lat[:, 0], lat[:, 1]), 1e-9)[:, None]
+        wide = 0.0 if c.get("tunnel") else PARAPET_W
+        gl, gr = medians[n]
+        covered[n] = (covered[n][0] | (gl > 0), covered[n][1] | (gr > 0))
+        el = left + u * np.maximum(wide, gl / 2 + 0.05)[:, None]
+        er = right - u * np.maximum(wide, gr / 2 + 0.05)[:, None]
+        k = len(z)
+        for sgn, edge, inner, cov in ((1, el, left, covered[n][0]),
+                                      (-1, er, right, covered[n][1])):
+            i = 0
+            while i < k:
+                if cov[i]:
+                    i += 1
+                    continue
+                j = i
+                while j + 1 < k and not cov[j + 1]:
+                    j += 1
+                run_len = float(np.hypot(*np.diff(edge[i:j + 1], axis=0).T).sum()) if j > i else 0.0
+                if j > i and (run_len >= PARAPET_MIN_M or i == 0 or j == k - 1):
+                    sl = slice(i, j + 1)
+                    edge_run, inner_run = edge[sl], inner[sl]
+                    mid_ = (left + right) / 2
+                    ends = list(c.get("abut") or [])
+                    if i > 0:                                       # the run stops there (a gap, a gore)
+                        ends.append(tuple(mid_[i]))
+                    if j < k - 1:
+                        ends.append(tuple(mid_[j]))
+                    out.append({
+                        "mid": mid_[sl],
+                        "ends": ends,
+                        "deck": n,
+                        "line": (edge_run + inner_run) * 0.5,
+                        "edge": edge_run,
+                        "inner": inner_run,
+                        "z": z[sl],
+                        "v": v[sl],
+                        "out": u[sl] * sgn,
+                    })
+                i = j + 1
     return out
 
 
@@ -1087,7 +1170,10 @@ def tunnel(chunks, origin, walls=()):
         hw = float(np.median(lw)) / 2 + TUNNEL_SHOULDER
         th = float(c.get("tunnel_h") or TUNNEL_H)
         low = th < TUNNEL_H - 0.05                          # a low arch: stone, a short portal face
-        mat = 3 if low else 5                               # (its portal faces: 2, the stone in daylight; a full
+        # (a major road's low arch in concrete, as its cutting's walls: the Gotthard road tunnel's portal, a cut-and-cover
+        # box under the meadow at Goeschenen, stood as a park's stone arch, 2026-10-28)
+        stone = low and not c.get("concrete")
+        mat = 3 if stone else 5                               # (its portal faces: 2, the stone in daylight; a full
                                                             # tube's inside: 5, TUNNEL_INNER)
         sec = _tunnel_section(hw, th, low)
         k, m = len(mid), len(sec)
@@ -1101,7 +1187,7 @@ def tunnel(chunks, origin, walls=()):
         for j in range(m - 1):
             a, b = rows[j], rows[j + 1]
             P.append(np.concatenate([a, b]))
-            if low:                                         # the stone at its scale: around the section, along
+            if stone:                                       # the stone at its scale: around the section, along
                 sj = float(np.hypot(*(sec[min(j + 1, m - 1)] - sec[j])))
                 s0 = float(np.sum(np.hypot(*np.diff(sec[:j + 1], axis=0).T))) if j else 0.0
                 along = np.concatenate(([0.0], np.cumsum(np.hypot(*np.diff(mid, axis=0).T))))
@@ -1148,17 +1234,17 @@ def tunnel(chunks, origin, walls=()):
             outer[:, 2] = z[at] + o[:, 1]
             outer -= origin
             P.append(np.concatenate([inner, outer]))
-            sc = STONE_UV_M if low else 4.0
+            sc = STONE_UV_M if stone else 4.0
             UV.append(np.column_stack((np.concatenate((sec[:, 0], o[:, 0])) / sc, np.concatenate((sec[:, 1], o[:, 1])) / sc)))
             i = np.arange(m - 1)
             A, A1, B, B1 = nv + i, nv + i + 1, nv + m + i, nv + m + i + 1
             tri = np.concatenate([np.stack([A, B, B1], 1), np.stack([A, B1, A1], 1)])
             T.append(np.concatenate([tri, tri[:, ::-1]]))   # seen from outside and from in the tube
-            M.append(2 if low else 0)
+            M.append(2 if stone else 0)
             nv += 2 * m
             if low and (cap_m is None or cap_m >= LOW_CAP_MIN):
                 nv = _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, float(np.max(o[:, 0])), float(o[:, 1].max()), th, origin,
-                               LOW_CAP_M if cap_m is None else min(LOW_CAP_M, float(cap_m)))
+                               LOW_CAP_M if cap_m is None else min(LOW_CAP_M, float(cap_m)), 2 if stone else 0)
     allm = [TUNNEL_SIDE, TUNNEL_LIGHT, TUNNEL_STONE, TUNNEL_STONE_IN, TUNNEL_SOIL, TUNNEL_INNER]
     Tall = np.concatenate(T)
     Mall = np.concatenate([np.full(len(t), m, np.int64) for t, m in zip(T, M)]) if M else np.zeros(len(Tall), np.int64)
@@ -1168,7 +1254,7 @@ def tunnel(chunks, origin, walls=()):
     return (np.concatenate(P), Tall, np.concatenate(UV), [allm[i] for i in used], remap[Mall])
 
 
-def _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, side, top, th, origin, depth=None):
+def _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, side, top, th, origin, depth=None, side_mat=2):
     """A low arch's stone top over its mouth (LOW_CAP_M back from the portal face at row `at`, side either way of
     the centre, `top` over the floor): its top, its sides down to the floor's level (outside the tube's walls) and
     its back down to just over the vault (th), seen from both sides. Appended to P, T, UV, M; returns the new vertex count."""
@@ -1195,7 +1281,7 @@ def _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, side, top, th, origin, depth=No
         UV.append(np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float64) / (SOIL_UV_M if qi == 0 else STONE_UV_M))
         tri = np.array([[nv, nv + 1, nv + 2], [nv, nv + 2, nv + 3]], np.int64)
         T.append(np.concatenate([tri, tri[:, ::-1]]))
-        M.append(4 if qi == 0 else 2)                   # its top grass, its sides stone
+        M.append(4 if qi == 0 else side_mat)            # its top grass, its sides stone (concrete: side_mat 0)
         nv += 4
     return nv
 

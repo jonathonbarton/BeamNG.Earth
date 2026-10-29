@@ -22,6 +22,8 @@ import roads
 
 LAT, LON = 41.10022, -105.06194
 NEAR_DEG = 2e-5     # ~2 m
+FAR_M = 600.0       # m from the bridge past which a missing sample takes the nearest (the banking's joined roads reach
+                    # further than the 1.7.0 capture, PR #410; nothing there shapes these decks)
 FIDS = ("a4ce4242-6c0c-4f09-af3f-4ef16198fae5", "c055323a-f109-486c-9a9d-ad07f216b366")
 
 
@@ -57,7 +59,9 @@ class OttoBridgeTest(TestCase):
                 if z is None:
                     d = np.abs(skeys[:, :2] - k[:2]).max(1)
                     n = int(np.argmin(d))
-                    if d[n] > NEAR_DEG * 1e9:
+                    far = max(abs(k[0] / 1e9 - LAT) * 111320.0,
+                              abs(k[1] / 1e9 - LON) * 111320.0 * np.cos(np.radians(LAT))) > FAR_M
+                    if d[n] > NEAR_DEG * 1e9 and not far:
                         raise KeyError(tuple(k))
                     z = svals[n]
                 out.append(z)
@@ -88,7 +92,8 @@ class OttoBridgeTest(TestCase):
             self.assertLess(float(np.abs(np.diff(slopes)).max()), 0.014, fid)
             approach = self.bridges._ground(self.data[f"approach{i}.xy"])
             # Fixed before/after reference: the motorway approaches are not lifted.
-            np.testing.assert_allclose(approach, self.data[f"approach{i}.z"], atol=0.003, rtol=0)
+            # (1 cm: the banking's joined-road context, PR #410, moves the far approach point by ~5 mm)
+            np.testing.assert_allclose(approach, self.data[f"approach{i}.z"], atol=0.01, rtol=0)
             np.testing.assert_allclose(z[[0, -1]], approach[[0, 5]], atol=1e-6, rtol=0)
             entering = (approach[0] - approach[1]) / 4.0
             leaving = (approach[6] - approach[5]) / 4.0
