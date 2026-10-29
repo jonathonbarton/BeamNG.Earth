@@ -225,9 +225,13 @@ def _assembly(frame, obj, pavements, q, direction, box, elev, chunks, content,
     lat, lon, _ = frame.enu_to_geodetic(float(at_xy[0]), float(at_xy[1]), 0.)
     import signstates
     state = str(signstates.states(lat, lon).item())
-    w, h = dimensions(content)
-    panels = [dict(label=content, width=w, height=h, offset=0., exit=False)]
-    if exit_label:
+    if content:
+        w, h = dimensions(content)
+        panels = [dict(label=content, width=w, height=h, offset=0., exit=False)]
+    else:                                   # (an exit panel alone: no room for a ground mount)
+        w, h = signs.dimensions(exit_label, 'advance', state)
+        panels = [dict(label=exit_label, width=w, height=h, offset=0., exit=True)]
+    if exit_label and content:
         ew, eh = signs.dimensions(exit_label, 'advance', state)
         panels[0]['offset'] = -side*(ew+.25)/2.
         panels.append(dict(label=exit_label, width=ew, height=eh,
@@ -259,6 +263,21 @@ def _assembly(frame, obj, pavements, q, direction, box, elev, chunks, content,
                 state=state)
 
 
+def exit_gantry(frame, obj, pavements, sign, elev, chunks=()):
+    """An overhead mount for a roadside advance sign that has no room beside the road (exitsigns.place:
+    'blocked'), at the same station; None when no gantry fits either (then the sign is not built)."""
+    extra = obj['exit']
+    approach = signs._xy(frame, extra['approach'])
+    near = signs._nearest(np.asarray(sign['centre'][:2], float), [('', None, approach, 0.)])
+    if near is None:
+        return None
+    found = _assembly(frame, obj, pavements, near[6], np.asarray(sign['travel'], float), (0., 0., 0., 0.),
+                      elev, chunks, None, extra['label'], int(extra['side']), sign['distance'], True)
+    if found:
+        found['advance_m'] = sign['advance_m']
+    return found
+
+
 def place(frame, objects, pavements, box, elev, chunks=(), mph=True, allow_outside=False):
     """Choose one station; allow an adjacent tile to check a roadside replacement.
 
@@ -284,7 +303,8 @@ def place(frame, objects, pavements, box, elev, chunks=(), mph=True, allow_outsi
         if 'through' in obj:
             q = signs._xy(frame, [extra['point']])[0]
             direction = signs._nearest(q, [('', None, approach, 0.)])[7]
-            result = _assembly(frame, obj, pavements, q, direction, box, elev, chunks, content)
+            result = _assembly(frame, obj, pavements, q, direction, box, elev, chunks, content,
+                               allow_outside=allow_outside)
         else:
             if signs.sign_style(extra['label']) != 'exit':
                 continue
@@ -294,6 +314,8 @@ def place(frame, objects, pavements, box, elev, chunks=(), mph=True, allow_outsi
             q, direction, _ = signs._station(approach, end[2]-distance)
             result = _assembly(frame, obj, pavements, q, direction, box, elev, chunks,
                                content, extra['label'], int(extra['side']), text, allow_outside)
+            if result:
+                result['advance_m'] = distance
         if result:
             out.append(result)
     return out
@@ -347,7 +369,11 @@ class Mesh(signs.Mesh):
         for panel in sign['panels']:
             self.centre = anchor+self.right*panel['offset']
             w, h, content = panel['width'], panel['height'], panel['label']
-            if panel['exit']:
+            if panel['exit'] and panel.get('rows'):
+                self.rounded_panel(w,bottom,h,0)
+                for row in signs.list_layout(panel['rows'], w, h):
+                    self.guide_text(row['value'],row['y'],bottom+row['baseline'],row['height'],row['max_width'])
+            elif panel['exit']:
                 # Reuse the established exit panel and tab layout without its posts.
                 self.rounded_panel(w,bottom,h,0)
                 if content['ref']:

@@ -58,38 +58,63 @@ def tile_objects(source, frame, tx, ty):
     return source.objects(frame, (x0 - m, y0 - m, x1 + m, y1 + m))
 
 
+def plan_tile(source, frame, tx, ty, elev, chunks=(), left_hand=False, mph=True, urban=None, widths=None):
+    """The sign records of a tile: (roadside exit signs, overhead assemblies, mile markers).
+
+    Every exit's advance signs are planned on the whole source neighbourhood first (not only this
+    tile), then exitsigns.consolidate spaces and combines them across exits, and only then is the
+    tile's share kept: closely spaced urban exits get one combined panel, never a stack.
+    """
+    box = roads.tile_bbox(tx, ty)
+    objects = tile_objects(source, frame, tx, ty)
+    if not objects:
+        return [], [], []
+    context = source.context(urban, widths)
+    everywhere = (-float('inf'), -float('inf'), float('inf'), float('inf'))
+    roadside_all, overhead_all, miles = [], [], []
+    for obj in sorted({o['id']: o for o in objects if o.get('exit')}.values(), key=lambda o: str(o['id'])):
+        pavements, mains = exitsigns.source_pavements(frame, obj, context, left_hand)
+        roadside = exitsigns.place(frame, [obj], (), everywhere, elev, chunks, left_hand, mph,
+                                   pavements=pavements, ramp_mains=mains)
+        distance = '1/2 MILE' if mph else '500 m'
+        paired = throughsigns.place(frame, [obj], pavements, box, elev, chunks, mph, allow_outside=True)
+        for s in roadside:
+            if paired and s['kind'] == 'advance' and s['distance'] == distance:
+                continue
+            if s.get('blocked'):
+                gantry = throughsigns.exit_gantry(frame, obj, pavements, s, elev, chunks)
+                if gantry:
+                    overhead_all.append(gantry)
+                continue
+            roadside_all.append(s)
+        overhead_all.extend(paired)
+    through_all = []
+    for obj in sorted({o['id']: o for o in objects if o.get('through')}.values(), key=lambda o: str(o['id'])):
+        pavements = throughsigns.source_pavements(frame, obj, context, left_hand)
+        through_all.extend(throughsigns.place(frame, [obj], pavements, box, elev, chunks, mph, allow_outside=True))
+    roadside_all, overhead_all = exitsigns.consolidate(roadside_all, overhead_all, mph, through_all)
+
+    def inside(s):
+        return box[0] <= s['centre'][0] < box[2] and box[1] <= s['centre'][1] < box[3]
+    exits = [s for s in roadside_all if inside(s)]
+    overheads = [s for s in overhead_all if inside(s)]
+    overheads += [s for s in through_all if inside(s)]
+    for obj in milemarkers.unique_objects(objects):
+        pavements = milemarkers.source_pavements(frame, obj, context, left_hand)
+        miles.extend(milemarkers.place(frame, [obj], pavements, box, elev, chunks))
+    return exits, overheads, miles
+
+
 def build_tile(md, frame, tx, ty, elev, chunks=(), left_hand=False, mph=True, urban=None, widths=None):
     """Return (exit mesh, mile-marker mesh); optional scenery cannot stop road generation."""
     source = getattr(md, 'highway_signs', None)
     if source is None:
         return None, None
     try:
-        box = roads.tile_bbox(tx, ty)
-        objects = tile_objects(source, frame, tx, ty)
-        if not objects:
+        exits, overheads, miles = plan_tile(source, frame, tx, ty, elev, chunks, left_hand, mph, urban, widths)
+        if not (exits or overheads or miles) and not tile_objects(source, frame, tx, ty):
             return None, None
-        context = source.context(urban, widths)
-        exits, miles, overheads = [], [], []
-        for obj in {o['id']: o for o in objects if o.get('exit')}.values():
-            pavements, mains = exitsigns.source_pavements(frame, obj, context, left_hand)
-            # Decide replacement in the full source context, even if the roadside
-            # panel and the gantry centre belong to different neighbouring tiles.
-            roadside = exitsigns.place(frame, [obj], (), box, elev, chunks, left_hand, mph,
-                                       pavements=pavements, ramp_mains=mains)
-            distance = '1/2 MILE' if mph else '500 m'
-            replaces = any(s['kind'] == 'advance' and s['distance'] == distance for s in roadside)
-            paired = throughsigns.place(frame, [obj], pavements, box, elev, chunks, mph,
-                                        allow_outside=replaces)
-            exits.extend(s for s in roadside if not (paired and s['kind'] == 'advance' and
-                                                     s['distance'] == distance))
-            overheads.extend(s for s in paired if box[0] <= s['centre'][0] < box[2]
-                             and box[1] <= s['centre'][1] < box[3])
-        for obj in {o['id']: o for o in objects if o.get('through')}.values():
-            pavements = throughsigns.source_pavements(frame, obj, context, left_hand)
-            overheads.extend(throughsigns.place(frame, [obj], pavements, box, elev, chunks, mph))
-        for obj in milemarkers.unique_objects(objects):
-            pavements = milemarkers.source_pavements(frame, obj, context, left_hand)
-            miles.extend(milemarkers.place(frame, [obj], pavements, box, elev, chunks))
+        box = roads.tile_bbox(tx, ty)
         origin = (box[0], box[1], 0.)
         return throughsigns.build(exits, overheads, origin), milemarkers.build(miles, origin)
     except CancelledError:
