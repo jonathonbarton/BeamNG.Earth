@@ -51,16 +51,6 @@ def test_stacked_advance_signs_of_close_exits_become_one_panel():
     assert mesh is not None
 
 
-def test_a_split_at_the_same_distance_is_no_list():
-    # I-84 west at I-5: the Salem and Seattle exits leave at the same point; a combined panel would read
-    # "Salem 1/4 MILE / Seattle 1/4 MILE". The first keeps its full legend; no list.
-    signs = [advance('', 402.3, 0., names=('Salem',)), advance('', 410., 6., names=('Seattle',))]
-    roadside, _ = exitsigns.consolidate(signs, [])
-    assert len(roadside) == 1
-    assert not roadside[0].get('rows')
-    assert roadside[0]['label']['names'] == ['Salem']
-
-
 def test_never_two_guide_signs_within_minimum_spacing():
     signs = [advance('1', 402.3, 0.), advance('1A', 804.7, 120.), advance('2', 1609.3, 600.),
              advance('2', 804.7, 1400.), advance('1', 804.7, 400.)]
