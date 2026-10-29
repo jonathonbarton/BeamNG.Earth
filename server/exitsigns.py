@@ -25,6 +25,13 @@ ADVANCE_METRIC = 500.
 DECISION_M = 35.                 # destination/arrow panel immediately before the exit entrance
 ADVANCE_MPH_STATIONS = ((1609.344, '1 MILE'), (804.672, '1/2 MILE'), (ADVANCE_MPH, '1/4 MILE'))
 GORE_SEARCH_M = 300.
+GROUND_SHIFT_STEPS = 6           # m a ground advance panel may step outward to clear other pavement
+MIN_SPACING_M = 150.             # never two guide signs on one roadway closer (MUTCD 2E: 800 ft apart where possible)
+MERGE_M = 250.                   # advance signs of different exits this close share one panel
+SAME_ROADWAY_M = 30.             # lateral offset within which two signs face the same carriageway
+PORTRAIT_MIN_W = 2.6               # smallest exit-direction panels (one short line)
+LANDSCAPE_MIN_W = 3.6
+MAX_ROWS = 3                     # exits listed on one combined panel
 GORE_CLEAR_M = 1.
 EXIT_KEYS = ('ref', 'name', 'noref', 'exit_to', 'junction:ref', 'destination',
              'destination:street', 'destination:ref', 'destination:ref:to',
@@ -439,18 +446,25 @@ def place(frame, objects, roads, box, elev, chunks=(), left_hand=False, mph=True
             # vary through lane-count changes, rather than being the native Spec width.
             edge = abs((cross[k]*(1.-t)+cross[k+1]*t)@right)*paved_width/2.
             centre = at[:2] + right * side * (edge + 2. + width / 2.)
-            if kind == 'decision':
-                # Never put the new panel in a nearby ramp/frontage-road pavement.
-                polygons = _outlines(pavements)
-                for _ in range(12):
-                    if _clear(centre, width/2+.5, polygons):
-                        break
-                    centre += right*side
-                else:
+            # Never put a ground panel in a nearby ramp, frontage road, the other carriageway across a
+            # narrow median or a parallel roadway: step outward a little, else ask for an overhead mount.
+            polygons = _outlines(pavements)
+            for _ in range(GROUND_SHIFT_STEPS if kind == 'advance' else 12):
+                if _clear(centre, width/2+.5, polygons):
+                    blocked = False
+                    break
+                centre += right*side
+            else:
+                if kind == 'decision':
                     continue
+                blocked = True
+                centre = at[:2] + right * side * (edge + 2. + width / 2.)
             if not (x0 <= centre[0] < x1 and y0 <= centre[1] < y1) or _on_deck(at[:2], chunks, 2.):
                 continue
-            out.append(_make_sign(obj, kind, centre, travel, at, frame, elev, side, width, height, text, distance, state))
+            sign = _make_sign(obj, kind, centre, travel, at, frame, elev, side, width, height, text, distance, state)
+            if kind == 'advance' and blocked:
+                sign['blocked'] = True       # (highwaysigns: an overhead or nothing; never in the lanes)
+            out.append(sign)
 
         width, height = dimensions(label, 'ramp')
         candidate = _gore(extra, approach, ramp, pavements, ramp_mains, width)
@@ -461,6 +475,162 @@ def place(frame, objects, roads, box, elev, chunks=(), left_hand=False, mph=True
             continue
         if not _on_deck(centre, chunks, width/2.+2.):
             out.append(_make_sign(obj, 'ramp', centre, travel, at, frame, elev, side, width, height))
+    return out
+
+
+def rounded_distance(metres, mph=True):
+    """An inexact advance distance for a combined panel: quarter miles (or 100 m)."""
+    if not mph:
+        return f'{max(100, int(round(metres/100.))*100)} m'
+    q = max(1, int(round(metres/ADVANCE_MPH)))
+    whole, part = divmod(q, 4)
+    frac = {1: '1/4', 2: '1/2', 3: '3/4'}.get(part, '')
+    if not whole:
+        return frac+' MILE'
+    return f'{whole} {frac} MILES' if frac else f'{whole} MILE' + ('S' if whole > 1 else '')
+
+
+def _row_ref(label):
+    if label.get('ref'):
+        return 'EXIT '+label['ref']
+    return (label.get('names') or ['EXIT'])[0]
+
+
+def _exit_key(label):
+    return (label.get('ref', ''), tuple(label.get('names', ())))
+
+
+def _host_label(sign):
+    if sign['kind'] == 'through':
+        return next((p['label'] for p in sign['panels'] if p['exit']), None)
+    return sign['label']
+
+
+def _offset(a, b):
+    """b's distance along a's road beyond a (+: farther on), or None if b faces another roadway."""
+    ta = np.asarray(a['travel'], float)
+    if ta@np.asarray(b['travel'], float) < .7:
+        return None
+    d = np.asarray(b['centre'][:2], float)-np.asarray(a['centre'][:2], float)
+    if abs(d@np.array([ta[1], -ta[0]])) >= SAME_ROADWAY_M:
+        return None
+    return float(d@ta)
+
+
+def consolidate(roadside, overheads, mph=True, obstacles=()):
+    """Space and combine advance guide signs of closely spaced exits (urban freeways).
+
+    Each exit's advance stations are planned on their own; here, per roadway and direction, the nearest
+    station of each exit wins (overheads first, then 1/4, 1/2, 1 mile). A later advance sign within
+    MERGE_M of a kept one is not built: its exit becomes a row of the kept sign ("EXIT 1A  1/2 MILE")
+    with a rounded distance. Advance signs within MIN_SPACING_M of another exit's decision sign are
+    dropped (MUTCD 2E: fewer advance signs where interchanges are close). Rural exits, whose stations
+    are far apart, are unchanged. obstacles: other overhead signs (route confirmation gantries) an
+    advance sign keeps MIN_SPACING_M from. Returns (roadside, overheads).
+    """
+    fixed = []
+    for s in roadside:                          # (one ramp mapped twice: one decision/gore sign)
+        if s['kind'] == 'advance':
+            continue
+        if any(f['kind'] == s['kind'] and np.asarray(f['travel'])@np.asarray(s['travel']) > .7 and
+               np.hypot(*np.subtract(f['centre'][:2], s['centre'][:2])) < SAME_ROADWAY_M for f in fixed):
+            continue
+        fixed.append(s)
+    decisions = [s for s in fixed if s['kind'] == 'decision']
+    exit_overheads = [s for s in overheads if s['kind'] == 'through' and any(p['exit'] for p in s['panels'])]
+    other_overheads = [s for s in overheads if not (s['kind'] == 'through' and any(p['exit'] for p in s['panels']))]
+    candidates = [(0, s.get('advance_m', 804.672), s) for s in exit_overheads] + \
+                 [(1, s['advance_m'], s) for s in roadside if s['kind'] == 'advance']
+    candidates.sort(key=lambda c: (c[0], c[1], str(c[2]['id']), c[2]['centre'][0], c[2]['centre'][1]))
+
+    kept = []
+    for _, metres, sign in candidates:
+        label = _host_label(sign)
+        near_decision = False
+        for d in decisions:
+            along = _offset(d, sign)
+            if along is not None and abs(along) < MIN_SPACING_M and _exit_key(d['label']) != _exit_key(label):
+                near_decision = True
+                break
+        if near_decision or any(_offset(o, sign) is not None and abs(_offset(o, sign)) < MIN_SPACING_M
+                                for o in obstacles):
+            continue
+        host = None
+        for k in kept:
+            along = _offset(k, sign)
+            if along is not None and abs(along) < MERGE_M:
+                host = (k, along)
+                break
+        if host is None:
+            sign = dict(sign)
+            sign['rows'] = [(_exit_key(label), _row_ref(label), metres)]
+            kept.append(sign)
+            continue
+        k, along = host
+        if any(r[0] == _exit_key(label) for r in k['rows']):
+            continue                            # (the same exit again: a duplicate record)
+        if len(k['rows']) < MAX_ROWS:
+            k['rows'].append((_exit_key(label), _row_ref(label), max(metres+along, 1.)))
+    out_roadside, out_overheads = list(fixed), list(other_overheads)
+    for sign in kept:
+        rows = sorted(sign.pop('rows'), key=lambda r: r[2])
+        if len(rows) > 1:
+            listed = [dict(ref=ref, distance=rounded_distance(m, mph)) for _, ref, m in rows]
+            if sign['kind'] == 'through':
+                sign['panels'] = [dict(p) for p in sign['panels']]
+                for p in sign['panels']:
+                    if p['exit']:
+                        p['rows'] = listed
+                        p['width'], p['height'] = list_dimensions(listed)
+                _respace_panels(sign)
+            else:
+                sign['rows'] = listed
+                width, height = list_dimensions(listed)
+                centre = np.asarray(sign['centre'][:2], float)
+                travel = np.asarray(sign['travel'], float)
+                right = np.array([travel[1], -travel[0]])
+                centre = centre + right*(1 if sign['side'] > 0 else -1)*(width-sign['width'])/2
+                sign.update(width=width, height=height, centre=[*map(float, centre), sign['centre'][2]])
+        (out_overheads if sign['kind'] == 'through' else out_roadside).append(sign)
+    return out_roadside, out_overheads
+
+
+def _respace_panels(sign):
+    """Side-by-side gantry panels after a panel's size changed (same order and gaps as throughsigns)."""
+    panels = sign['panels']
+    if len(panels) == 2:
+        through, exit_panel = (panels[0], panels[1]) if panels[1]['exit'] else (panels[1], panels[0])
+        side = 1 if sign['side'] > 0 else -1
+        through['offset'] = -side*(exit_panel['width']+.25)/2.
+        exit_panel['offset'] = side*(through['width']+.25)/2.
+        h = max(p['height'] for p in panels)
+        for p in panels:
+            p['height'] = h
+    else:
+        panels[0]['offset'] = 0.
+
+
+LIST_CAP, LIST_PITCH = .52, .82
+
+
+def list_dimensions(rows):
+    """A combined advance panel: one row per exit, the exit number left and its distance right."""
+    ref = max(guide_width(r['ref'], LIST_CAP) for r in rows)
+    dist = max(guide_width(r['distance'], LIST_CAP) for r in rows)
+    return ref+dist+1.0+.76, .5+LIST_CAP+(len(rows)-1)*LIST_PITCH+.5
+
+
+def list_layout(rows, width, height):
+    """Text rows of a combined panel (Mesh.panel and the overhead's exit panel)."""
+    top = height-.5
+    ref = max(guide_width(r['ref'], LIST_CAP) for r in rows)
+    dist = max(guide_width(r['distance'], LIST_CAP) for r in rows)
+    out = []
+    for i, r in enumerate(rows):
+        baseline = top-LIST_CAP-i*LIST_PITCH
+        out.append(dict(value=r['ref'], y=-width/2+.38+ref/2, baseline=baseline, height=LIST_CAP, max_width=ref+.01))
+        out.append(dict(value=r['distance'], y=width/2-.38-dist/2, baseline=baseline, height=LIST_CAP,
+                        max_width=dist+.01))
     return out
 
 
@@ -602,13 +772,14 @@ def dimensions(label, kind, state=''):
         groups = [(1.08 if r['kind'] in ('us','interstate') and len(r['number']) >= 3 else .86)
                   + (.28+guide_width(r['qualifier'].title(),.46)
                      if r['qualifier'] in ('NORTH','SOUTH','EAST','WEST') else 0.) for r in routes]
-        width = min(6.0, max(3.5, max([guide_width(s,.58) for s in names]+groups+[0.])+.65))
-        return width, max(width*1.22, .6+len(routes)*1.20+len(names)*.85+1.1)
+        # Sized by the legend (MUTCD 2E.14-2E.15: the panel follows its lines, not a fixed blank).
+        width = min(6.0, max(PORTRAIT_MIN_W, max([guide_width(s,.58) for s in names]+groups+[0.])+.65))
+        return width, .6+len(routes)*1.20+len(names)*.85+1.1
     lines = label['names'] or ([] if label['routes'] else ['EXIT '+label['ref']])
-    longest = max([guide_width(s, .64) for s in lines]+[2.7])
-    width = min(8.5, max(5., longest+.76+.95+(1.45 if label['routes'] else 0.)))
+    longest = max([guide_width(s, .64) for s in lines]+[1.5])
+    width = min(8.5, max(LANDSCAPE_MIN_W, longest+.76+.95+(1.45 if label['routes'] else 0.)))
     content = max(.64+max(0,len(lines)-1)*.89, len(route_symbols(label['routes']))*1.24-.28)
-    return width, max(2.65, content+1.22)
+    return width, max(2.2, content+1.22)
 
 
 class Mesh:
@@ -854,6 +1025,10 @@ class Mesh:
                 self.arrow(0.,bottom+.43,side<0,1.1)
             return
         self.rounded_panel(width,bottom,height,0)
+        if sign.get('rows'):
+            for row in list_layout(sign['rows'], width, height):
+                self.guide_text(row['value'],row['y'],bottom+row['baseline'],row['height'],row['max_width'])
+            return
         top = bottom+height
         if label['ref']:
             tab_width = min(width, max(2.2, guide_width('EXIT '+label['ref'], .36)+.5))
