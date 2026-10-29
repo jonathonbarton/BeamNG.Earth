@@ -505,9 +505,63 @@ class ParkingDeckTest(unittest.TestCase):
             n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
             up = n[:, 2] / np.maximum(np.linalg.norm(n, axis=1), 1e-9)
             return sorted(map(tuple, np.round(tri[(up > 0.98) & (up < 0.99999)].reshape(-1, 9), 3).tolist()))
-        self.assertTrue(sloped_tops(P, T))
-        self.assertEqual(sloped_tops(P, T), sloped_tops(Pc, Tc), "the ramps' collision is the drawn one")
+        paint = M == bld.MATERIALS.index(bld.LINE_PAINT)
+        self.assertTrue(paint.any(), "stall lines drawn")
+        self.assertTrue(sloped_tops(P, T[~paint]))
+        self.assertEqual(sloped_tops(P, T[~paint]), sloped_tops(Pc, Tc), "the ramps' collision is the drawn one")
+        self.assertNotIn(bld.MATERIALS.index(bld.LINE_PAINT), set(bld.collision_mesh([(spec, 0.0, 0.0)])[3].tolist()),
+                         "no paint in the collision")
         self.assertEqual(bld.collider_boxes([(spec, 0.0, 0.0)], 0, 0), [], "driven into: no keep-out box")
+
+    def test_stall_paint_lies_on_the_floors(self):
+        # 2026-10-28: the stall lines painted in game, on every level, ramps included, clear of columns and aisles
+        for scheme in bld.SCHEMES:
+            with self.subTest(scheme):
+                ring, floors, storey, lay = self.forced(scheme) if scheme != "speed_ramp" else                     self.forced(scheme, w=90, d=40, floors=3)
+                lines = bld.garage_paint(ring, lay)
+                self.assertTrue(lines)
+                zs, (P, UV, T, M, C) = self.module_floors((ring, floors, storey, lay))
+                pm = bld.Mesh()
+                bld._paint(pm, ring, lay, bld.garage_levels(lay, storey, 0.03), bld._Looks(1.0)[bld.LINE_PAINT])
+                Pp, _, Tp, _, _ = pm.arrays()
+                tri = Pp[Tp]
+                nz = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])[:, 2]
+                self.assertTrue((nz > 0).all(), "paint faces up")
+                levels = set()
+                for v in Pp[::7]:
+                    under = [z for z in self.surfaces(P, T, v[0], v[1]) if z <= v[2] + 1e-6]
+                    self.assertTrue(under, v)
+                    self.assertAlmostEqual(v[2] - max(under), bld.PAINT_LIFT_M, delta=2e-3, msg=v)
+                    levels.add(round(max(under), 2))
+                self.assertGreater(len(levels), floors, "every level painted")
+                self.assertAlmostEqual(Pp[:, 2].max() - bld.PAINT_LIFT_M, zs[-1], delta=0.3, msg="the top deck (double-threaded: its last ramp up to it)")
+                cols = np.array(bld.module_columns(ring, lay))
+                for p, q, _ in lines:
+                    for x in (p, q):
+                        self.assertTrue(lay.s0 - 1e-6 <= float((x - lay.A) @ lay.u) <= lay.s1 + 1e-6, "not in an end bay")
+                    for t in np.linspace(0, 1, 9):
+                        x = p + (q - p) * t
+                        self.assertGreater(np.min(np.abs(cols - x).max(1)), 0.25 + bld.PAINT_W_M / 2, "off columns")
+                _, aisles = bld.garage_stalls(lay)
+                wp, mw, vp, aw = lay.dims
+                for p, q, _ in lines:
+                    if lay.angle != 90 and abs(float((q - p) @ lay.n)) < 1.0:
+                        continue                                    # (the aisle's arrows)
+                    for x in (p, q):
+                        d = float((x - lay.A) @ lay.n)
+                        self.assertFalse(any(a0 + 1e-6 < d < a1 - 1e-6 for a0, a1 in aisles), "not in an aisle")
+
+    def test_one_way_garage_gets_arrows(self):
+        ring, floors, storey, lay = self.forced("double_thread")
+        if lay.angle == 90:
+            for k in range(20):
+                lay = bld._garage_layout(ring, storey, floors, k / 20 + 0.01, schemes=("double_thread",))
+                if lay.angle != 90:
+                    break
+        self.assertNotEqual(lay.angle, 90)
+        lines = bld.garage_paint(ring, lay)
+        along = [(p, q) for p, q, _ in lines if abs(float((q - p) @ lay.n)) < 1e-6]
+        self.assertTrue(along, "arrow shafts along the aisle")
 
     def test_small_garages_speed_ramp_then_switchback(self):
         _, (_, _, _, lay) = self.module_garage(50, 40, 9.1)

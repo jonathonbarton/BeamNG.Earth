@@ -76,9 +76,10 @@ BARN_CLASSES = {"barn", "farm_auxiliary", "stable", "cowshed"}
 MARBLE = "bne_bld_marble"   # cut white marble (the stock m_marble_cut): Baltimore's row house steps
 BRICK_WALL = "bne_bld_brick"    # plain red brick (the stock brick_plain): a garage's skin
 CONCRETE = "bne_bridge_concrete"  # plain concrete (tunnel.materials.json): a precast garage's skin
+LINE_PAINT = "line_white"   # the roads' white lane line (stock decal material, loaded with the road materials): garage stalls
 SKY_WALL = "bne_bld_sky"    # the skyline's walls: plain (vertex colours), their windows lit at night (_sky_mesh)
 MATERIALS = (FACADE, SHOP, OFFICE, ROOF_FLAT, ROOF_SLATE, ROOF_SHINGLE, SIDING, STUCCO, ROOF_METAL, PANEL, METALWALL,
-             STONE, MARBLE, BRICK_WALL, CONCRETE, SKY_WALL)
+             STONE, MARBLE, BRICK_WALL, CONCRETE, SKY_WALL, LINE_PAINT)
 LOOKS = {
     "bne_bridge_steel": (METALWALL, (0.50, 0.52, 0.54)),
     "bne_marble": (MARBLE, (1.0, 1.0, 1.0)),
@@ -90,6 +91,7 @@ LOOKS = {
     "bne_bld_fac_brickdark": (FACADE, (0.78, 0.72, 0.70)), "bne_bld_fac_brickwarm": (FACADE, (1.0, 0.88, 0.80)),
     "bne_bld_fac_blue": (FACADE, (0.80, 0.87, 0.96)), "bne_bld_fac_green": (FACADE, (0.84, 0.92, 0.82)),
     "bne_bld_fac_rose": (FACADE, (0.99, 0.86, 0.82)), "bne_bld_fac_yellow": (FACADE, (1.0, 0.95, 0.72)),
+    LINE_PAINT: (LINE_PAINT, (1.0, 1.0, 1.0)),
     SHOP: (SHOP, (1.0, 1.0, 1.0)), OFFICE: (OFFICE, (1.0, 1.0, 1.0)), SIDING: (SIDING, (0.93, 0.92, 0.88)),
 }
 ROOF_TINTS = {               # per roof material: the colours a building's roof takes (hashed)
@@ -2350,7 +2352,7 @@ def garage_stalls(lay):
     return lines, aisles
 
 
-def _module_deck(m, spec, gmin, gmax, mat_idx, ring, floors, storey, lay):
+def _module_deck(m, spec, gmin, gmax, mat_idx, ring, floors, storey, lay, paint=False):
     """The CCDC garage: its floors, skin, perimeter columns and interior columns on the module lines between
     back-to-back stall rows (never in an aisle, none in the end bays where the cars turn)."""
     mat = mat_idx[f"{PANEL}|{len(WALL_TINTS[PANEL]) - 1 - int(_hash01(spec.seed, 'deck') * 2)}"]
@@ -2378,6 +2380,8 @@ def _module_deck(m, spec, gmin, gmax, mat_idx, ring, floors, storey, lay):
             _box(m, p + d * t + inward * 0.35, d, 0.25, 0.25, zs[0] - FOUNDATION_M, zs[-1], mat)
     for c in module_columns(ring, lay):
         _box(m, c, lay.u, 0.25, 0.25, zs[0] - FOUNDATION_M, zs[-1], mat)
+    if paint:                                   # (drawn only: collision_mesh passes paint=False)
+        _paint(m, ring, lay, garage_levels(lay, storey, gmax + 0.03), mat_idx[LINE_PAINT])
 
 
 def garage_floors(height):
@@ -2408,13 +2412,92 @@ def deck_plan(spec, gmin, gmax):
     return None if lay is None else (ring, floors, storey, lay)
 
 
-def _parking_deck(m, spec, gmin, gmax, mat_idx):
+# Garage paint (2026-10-28): the stall lines garage_stalls plans, drawn as the roads draw their lane lines: thin quads
+# in the stock line_white decal material (u 0..1 across, v = length / its texture length), lying PAINT_LIFT_M over the
+# slab's top as roadmesh lays its markings DECK_SKIN over a bridge deck (no z-fighting), on every level the stall row
+# has a floor, following a sloped floor's plane. Drawn only (build); collision_mesh never gets them.
+PAINT_W_M = 0.10            # a stall line (4")
+PAINT_LIFT_M = 0.01         # m over the slab (roadmesh.DECK_SKIN)
+PAINT_TL_M = 6.4            # m of texture along (roads.EDGE_LINE)
+PAINT_CLEAR_M = 0.65        # stall lines start this far in from a module line (the columns: 0.25 half width there,
+                            # perimeter columns 0.35 + 0.25 in from the outline; parapets 0.15 + 0.1)
+ARROW_LEN_M = 3.0           # one-way aisles: an arrow down the aisle's centre ...
+ARROW_HEAD_M = 1.0          # ... its head strokes this long ...
+ARROW_EVERY_M = 20.0        # ... about this far apart
+
+
+def garage_paint(ring, lay):
+    """The garage's painted lines in plan with the floors they lie on: [(p (2,), q (2,), [(ha, hb) | (h, h)])] per
+    line, each floor a pair of half-levels at s0 and s1 (a sloped strip's slab; equal for a flat floor). Stall side
+    lines (each row's last stall closed too), PAINT_CLEAR_M clear of the module lines (columns, parapets), kept
+    inside the outline; one-way schemes (angled stalls) an arrow every ARROW_EVERY_M down each aisle's centre,
+    pointing with the traffic. Never across an aisle: a stall line ends at the aisle's edge (the vehicle projection)."""
+    wp, mw, vp, aw = lay.dims
+    flat_floors = [(0, 0)] + [(h, h) for h in lay.flat if h > 0]
+    if lay.scheme == "speed_ramp":
+        r1 = lay.strips[0][1]
+        rows = [(r1 + j * mw, r1 + (j + 1) * mw, 1.0, flat_floors) for j in range(lay.modules)]
+    else:
+        rows = [(d0, d1, 1.0 if not sl or sl[0][1] >= sl[0][0] else -1.0, list(sl) if sl else flat_floors)
+                for d0, d1, sl in lay.strips if d1 - d0 > mw - 0.5]
+    ang = math.radians(lay.angle)
+    out = []
+
+    def keep(p, q, floors):
+        sp, sq = float((p - lay.A) @ lay.u), float((q - lay.A) @ lay.u)
+        if min(sp, sq) < lay.s0 - 1e-6 or max(sp, sq) > lay.s1 + 1e-6:
+            return                                  # (an angled row's last lines: not out into an end bay)
+        if _inside(ring, p) and _inside(ring, q) and _inside(ring, (p + q) / 2):
+            out.append((p, q, floors))
+
+    for d0, d1, lean, floors in rows:
+        for e, sgn in ((d0, 1.0), (d1, -1.0)):
+            n = int((lay.s1 - lay.s0 - 2 * ROW_BUFFER_M) // wp)
+            for k in range(n + 1):
+                s = lay.s0 + ROW_BUFFER_M + k * wp
+                p = lay.A + lay.u * s + lay.n * e
+                tip = p + lay.n * (sgn * vp) + lay.u * (lean * vp / math.tan(ang) if lay.angle != 90 else 0.0)
+                p = p + (tip - p) * (PAINT_CLEAR_M / vp)
+                keep(p, tip, floors)
+        if lay.angle != 90:                         # one-way: arrows with the traffic (the stalls' lean)
+            c = (d0 + d1) / 2
+            for s in np.arange(lay.s0 + ARROW_EVERY_M / 2, lay.s1 - ARROW_LEN_M, ARROW_EVERY_M):
+                a = lay.A + lay.u * s + lay.n * c
+                b = a + lay.u * (lean * ARROW_LEN_M)
+                for side in (1.0, -1.0):
+                    back = b - lay.u * (lean * ARROW_HEAD_M * 0.7) + lay.n * (side * ARROW_HEAD_M * 0.7)
+                    keep(back, b, floors)
+                keep(a, b, floors)
+    return out
+
+
+def _paint(m, ring, lay, zh, mat):
+    """garage_paint's lines as quads PAINT_LIFT_M over each of their floors (a sloped slab's plane: z linear in s
+    from s0 to s1)."""
+    for p, q, floors in garage_paint(ring, lay):
+        d = q - p
+        L = float(np.hypot(*d))
+        if L < 1e-6:
+            continue
+        w = np.array([-d[1], d[0]]) / L * (PAINT_W_M / 2)
+        corners = (p - w, q - w, q + w, p + w)          # counter-clockwise from above
+        uv = ((1.0, 0.0), (1.0, L / PAINT_TL_M), (0.0, L / PAINT_TL_M), (0.0, 0.0))
+        for ha, hb in floors:
+            za, zb = zh(ha), zh(hb)
+            pts = []
+            for c in corners:
+                f = min(1.0, max(0.0, float((c - lay.A) @ lay.u - lay.s0) / max(lay.s1 - lay.s0, 1e-9)))
+                pts.append((float(c[0]), float(c[1]), za + (zb - za) * f + PAINT_LIFT_M))
+            m.quad(*pts, *uv, mat)
+
+
+def _parking_deck(m, spec, gmin, gmax, mat_idx, paint=False):
     """The open parking structure (see DECK_*); False when it does not apply (the caller draws the box)."""
     plan_ = deck_plan(spec, gmin, gmax)
     if plan_ is None:
         return False
     if isinstance(plan_[3], GarageLayout):
-        _module_deck(m, spec, gmin, gmax, mat_idx, *plan_)
+        _module_deck(m, spec, gmin, gmax, mat_idx, *plan_, paint=paint)
         return True
     ring, floors, storey, (i, A, u, n, s0, s1) = plan_
     # weathered concrete (Baltimore's street photos: the white decks read as a skeleton; city garages are grey)
@@ -2612,7 +2695,7 @@ def build(specs_and_ground, lite=False):
             continue
         ring = drawn_ring(spec)
         mh = spec.min_h or 0.0
-        if spec.deck and not lite and _parking_deck(m, spec, gmin, gmax, mat_idx):
+        if spec.deck and not lite and _parking_deck(m, spec, gmin, gmax, mat_idx, paint=True):
             continue
         z0 = gmin - (SKIRT_LITE_M if lite else SKIRT_M) if mh <= 0.5 else base_z(spec, gmin, gmax) + mh
         z_eave = base_z(spec, gmin, gmax) + mh + spec.height
