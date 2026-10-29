@@ -787,7 +787,7 @@ def landmark_kind(ring, attrs, on_water=False, ml=False):
     c, u, hl, hw = oriented_box(r)
     if 2 * hl >= SHIP_MIN_L and SHIP_SLENDER * hw <= hl <= SHIP_MAX_SLENDER * hw and cls in ("", "yes", "ship", "museum") \
             and SHIP_FILL[0] <= area / max(4 * hl * hw, 1e-6) <= SHIP_FILL[1] \
-            and (on_water or SHIP_NAME.search(name)) \
+            and (SHIP_NAME.search(name) or (on_water() if callable(on_water) else on_water)) \
             and min(_end_widths(r, c, u, hl)) <= SHIP_END_SHARE * 2 * hw:
         return "ship"
     if rs in ("dome", "onion"):
@@ -2622,7 +2622,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             if is_ml:
                 at = dict(at, ml=True)          # (_ml_steep once its ground is known)
             elif on is None and mh <= 0.5:
-                lk = landmark_kind(ring, at, on_water=_on_water(ring.mean(0), water_xy))
+                lk = landmark_kind(ring, at, on_water=lambda: _on_water(ring.mean(0), water_xy))     # (asked last: slow)
                 if lk:
                     at = dict(at, landmark=lk, ship_parts=funnels)
             attrs.append(at)
