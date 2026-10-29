@@ -1769,9 +1769,8 @@ def build_parts(specs_and_ground, lite=False, max_verts=MAX_MESH_VERTS, with_lod
 DECK_LANE_M = 3.6           # a ramp lane
 DECK_EDGE_M = 0.8           # the ramp lanes start this far in from the wall (the columns stand there)
 DECK_LANDING_M = 7.0        # flat deck at each end of the ramps (the U-turn)
-DECK_SLOPE = 0.17           # the steepest ramp
+DECK_SLOPE = 0.17           # the steepest switchback ramp (CCDC p.18: up to 20 % for a covered non-parking ramp)
 DECK_SLAB_M = 0.3
-DECK_PARAPET_M = 1.0
 DECK_COLUMN_M = 9.0         # perimeter column spacing
 DECK_LEVEL_M = 3.5          # ground this uneven (max - min) under the footprint: no deck (up to it: the ground deck
                             # level at the highest ground on a plinth, driven into from the uphill side)
@@ -1793,7 +1792,7 @@ def _deck_layout(ring, storey):
         a, b = ring[i], ring[(i + 1) % len(ring)]
         L = lens[i]
         s0, s1 = 0.5 + DECK_LANDING_M, L - 0.5 - DECK_LANDING_M
-        if s1 - s0 < storey / DECK_SLOPE:
+        if s1 - s0 - TRANSITION_M < storey / DECK_SLOPE:   # (its middle steeper by the p.18 transitions)
             return None                         # the rest are shorter
         u = (b - a) / L
         n = np.array([-u[1], u[0]])             # the inside is on the left
@@ -1811,26 +1810,120 @@ def _deck_wall(m, p, q, z0, z1, mat, t=0.2):
         _box(m, (p + q) / 2, d / L, L / 2, t / 2, z0, z1, mat)
 
 
+# ------------------------------------------------------------------------------------------- parking structures
 # The parking-module garage (the user, 2026-10-28, a garage by Century Winchester in San Jose: "no room to turn",
-# "ramp far too narrow, a slot between tall walls", "gaps"): real garages are laid out in parking modules, each
-# | 90-degree bays 6 m | two traffic lanes | bays 6 m | about 19 m across, side by side; the ramp is one whole
-# module sloped from one storey to the next ("sloped floor" / split bay), between flat cross-aisle end bays at
-# least a module long where the cars turn round. Here: the module strip along one long outer edge slopes up from
-# end A (s0) to end B (s1) on every storey (the slabs parallel: a storey of headroom everywhere); a car comes up at
-# B, drives back along the flat module(s) beside it to A and takes the next one up (both lanes two-way).
-PARK_BAY_M = 6.0            # a 90-degree stall, its clearances included
-AISLE_LANE_M = 3.65         # a traffic lane of the module's aisle
-MODULE_M = 2 * PARK_BAY_M + 2 * AISLE_LANE_M      # 19.3 m: one parking module
-MODULE_END_M = MODULE_M     # m of flat end bay (the turn-round) at each end of the sloped module
-RAMP_GRADE = 0.067          # the steepest parking-in-ramp (sloped floor with stalls on it)
-RAMP_GRADE_MAX = 0.12       # a short garage's sloped module up to this (a drive ramp's grade, stalls or not)
+# "ramp far too narrow, a slot between tall walls", "gaps"; then: encode garages "variously" to the CCDC standard).
+#
+# The standard: CCDC (Capital City Development Corporation, Boise) Parking Structure Design Guidelines, update
+# 2019-07-18, ccdcboise.com/wp-content/uploads/2022/04/CCDC-PDG-Update-7-18-2019.pdf. "p.N" below is the document's
+# own printed page number (the PDF's page N + 2). Feet in the table, metres in code (FT).
+#
+# | rule                                              | value                                   | page |
+# |---------------------------------------------------|-----------------------------------------|------|
+# | parking (sloped-floor) ramp, preferred            | <= 5 %                                  | 17   |
+# | parking ramp, maximum (IBC)                       | 6.67 % (7 % tolerated, dense urban)     | 17   |
+# | non-parking ramp (helix, express, speed)          | 12-14 % max (20 % if covered/snow-melt) | 18   |
+# | ramp-end transitions                              | grade >= 8 %: >= 10' long, half grade   | 18   |
+# | structural clear height                           | 8'-2" (vans); 7'-4" w/o vans; 13'-6"    | 18-19|
+# |                                                   | for trucks/buses on the ground floor    |      |
+# | floor-to-floor                                    | ~10' minimum (one 360 deg turn = 10')   | 21   |
+# | floor-to-floor for adaptive reuse                 | 15' ground, 12' upper                   | 11   |
+# | one-way traffic                                   | never with 90 deg stalls                | 20   |
+# | single-threaded, 2 bays two-way 90 deg            | ~122' x 155' min, 5' rise per bay;      | 21   |
+# |                                                   | ~255' long: one bay sloped 10', one flat|      |
+# | single-threaded levels                            | <= 6 preferred                          | 21   |
+# | double-threaded (one-way, angled)                 | 54-58' modules, 60/70/75 deg preferred, | 23   |
+# |                                                   | 10' rise per module, ~240' long,        |      |
+# |                                                   | rises 2 levels per 360 deg; 7+ levels   |      |
+# | double-loaded bay width                           | 54-60'; ideal length >= 240'            | 13   |
+# | module / stall / aisle by angle and UCF           | CCDC_LAYOUT below                       | 30   |
+# | end-bay drive aisle, two-way                      | >= 26'                                  | 31   |
+# | striped buffer, last stall to aisle               | >= 3'                                   | 31   |
+# | turning radius, cars                              | inside 15', outside 30'                 | 31   |
+# | turning radius, single-unit trucks/buses          | inside 28', outside 42'                 | 31   |
+# | stall beside wall/column/stair                    | +1' wider                               | 31   |
+# | column spacing, short span                        | ~27' x 30' (a column every 3 stalls)    | 63   |
+# | column spacing, cast-in-place / precast           | 20-27' / 18-22'                         | 52,54|
+# | entry/exit with control equipment                 | <= 3 % slope; 75-100' (150') from corner| 27   |
+# | accessible stall                                  | 8' + 5' aisle (van: 8' aisle), <= 2 %   | 34   |
+# | accessible route                                  | <= 5 % running, <= 2 % cross, >= 3' wide| 35   |
+# | stairs                                            | >= 44" wide, in dead corners            | 33   |
+# | elevator                                          | >= 5'-0" x 7'-0" car, 3,500 lb          | 33   |
+# | floor drainage slope                              | 2 % desired, 1.5 % min (not drawn)      | 48   |
+# | ground-floor retail on street sides               | encouraged (not drawn)                  | 58   |
+# | barrier/parapet height                            | not given: IBC guard 42"                | -    |
+FT = 0.3048
+
+
+def _ft(s):
+    """Feet from 12'-9" style text."""
+    f, i = s.replace('"', "").split("'")
+    return int(f) * FT + (int(i.strip("-") or 0) * FT / 12.0)
+
+
+# p.30 Parking Layout Dimensions (wall-to-wall double-loaded module): (user comfort factor, angle) -> stall width
+# projection WP, module width MW, vehicle projection VP, aisle width AW. UCF 4 = 9'-0" stalls (LOS A), UCF 3 =
+# 8'-9" (LOS B: visitors, retail), UCF 2 = 8'-6" (LOS C: commuters, residents) (p.29).
+CCDC_LAYOUT = {(u, a): tuple(_ft(v) for v in row.split()) for u, rows in {
+    4: {45: "12'-9\" 49'-10\" 17'-7\" 14'-8\"", 50: "11'-9\" 51'-7\" 18'-2\" 15'-3\"",
+        55: "11'-0\" 53'-0\" 18'-8\" 15'-8\"", 60: "10'-5\" 54'-6\" 19'-0\" 16'-6\"",
+        65: "9'-11\" 55'-9\" 19'-2\" 17'-5\"", 70: "9'-7\" 57'-0\" 19'-3\" 18'-6\"",
+        75: "9'-4\" 58'-0\" 19'-1\" 19'-10\"", 90: "9'-0\" 62'-0\" 18'-0\" 26'-0\""},
+    3: {45: "12'-4\" 48'-10\" 17'-7\" 13'-8\"", 50: "11'-5\" 50'-7\" 18'-2\" 14'-3\"",
+        55: "10'-8\" 52'-0\" 18'-8\" 14'-8\"", 60: "10'-1\" 53'-6\" 19'-0\" 15'-6\"",
+        65: "9'-8\" 54'-9\" 19'-2\" 16'-5\"", 70: "9'-4\" 56'-0\" 19'-3\" 17'-6\"",
+        75: "9'-1\" 57'-0\" 19'-1\" 18'-10\"", 90: "8'-9\" 61'-0\" 18'-0\" 25'-0\""},
+    2: {45: "12'-0\" 47'-10\" 17'-7\" 12'-8\"", 50: "11'-1\" 49'-7\" 18'-2\" 13'-3\"",
+        55: "10'-5\" 51'-0\" 18'-8\" 13'-8\"", 60: "9'-10\" 52'-6\" 19'-0\" 14'-6\"",
+        65: "9'-5\" 53'-9\" 19'-2\" 15'-5\"", 70: "9'-1\" 55'-0\" 19'-3\" 16'-6\"",
+        75: "8'-10\" 56'-0\" 19'-1\" 17'-10\"", 90: "8'-6\" 60'-0\" 18'-0\" 24'-0\""},
+}.items() for a, row in rows.items()}
+CCDC_ONE_WAY_ANGLES = (60, 70, 75)          # p.23: the preferred angles for one-way angled parking
+PARK_RAMP_PREF = 0.05                       # p.17
+PARK_RAMP_MAX = 0.0667                      # p.17 (IBC)
+SPEED_RAMP_MAX = 0.12                       # p.18 (12-14 %): non-parking ramps
+SPEED_RAMP_MAX2 = 0.14
+TRANSITION_FROM = 0.08                      # p.18: a grade from this needs transitions at both ends ...
+TRANSITION_M = 10 * FT                      # ... at least 10' long, at half the grade
+CLEAR_M = 8 * FT + 2 * FT / 12              # p.18: 8'-2" structural clear height (accessible vans)
+STOREY_STD_M = 10 * FT                      # p.21: floor-to-floor ~10' (one 360 deg turn rises 10')
+STOREY_MAX_M = 12 * FT                      # p.11: 12' upper floors (adaptive reuse): the tallest we draw
+SINGLE_THREAD_MAX_FLOORS = 6                # p.21
+DOUBLE_THREAD_MIN_FLOORS = 4                # p.23 recommends 7+; mapped garages are rarely that tall
+LONG_GARAGE_M = 240 * FT                    # p.13 / p.23: an ideal (double-threaded) length
+END_AISLE_M = 26 * FT                       # p.31: an end bay's two-way drive aisle at least
+TURN_OUT_M = 30 * FT                        # p.31: outside turning radius (inside 15')
+ROW_BUFFER_M = 3 * FT                       # p.31: striped buffer between the last stall and the aisle
+SPEED_END_M = TURN_OUT_M + ROW_BUFFER_M     # flat deck at each end of a speed ramp: room for the U-turn
+COLUMN_EVERY_STALLS = 3                     # p.63: short span, a column about every three stalls (27' x 30')
+DECK_PARAPET_M = 42 / 12 * FT               # not in CCDC: the IBC's 42" guard (a low parapet, not a wall)
+
+# The 90-degree UCF-4 module (62'): kept as the reference module
+PARK_BAY_M = CCDC_LAYOUT[(4, 90)][2]
+AISLE_LANE_M = CCDC_LAYOUT[(4, 90)][3] / 2
+MODULE_M = CCDC_LAYOUT[(4, 90)][1]
 RAMP_PARAPET_IN_M = 0.15    # m the ramp's parapets stand in from its edges
 MERGE_COLLINEAR_M = 0.6     # m off the line through its neighbours a vertex may be and still be dropped
 
+# The circulation schemes (p.21-26). Levels are counted in half storeys (h): deck k is h = 2k; the ground deck
+# (h = 0) is the whole outline. Along the chosen edge the garage is: a west end bay (s < s0), the middle (s0..s1)
+# cut into strips (modules) inward from the edge, an east end bay (s > s1). A strip is sloped (one slab per storey,
+# from half-level ha at s0 to hb at s1) or flat; the rest of the middle is flat at every deck.
+#   one_bay        single-threaded, one bay sloped a whole storey, the others flat (p.21 "one level bay"), two-way 90
+#   two_ramps      the same with the first and last bays sloped (inbound and outbound ramp): long garages
+#   both_bays      single-threaded with sloping floors (p.21): every bay sloped half a storey, the end bays half a
+#                  storey apart, one-way loop; 90 two-way or angled one-way
+#   double_thread  double-threaded (p.23): every bay sloped a whole storey, alternate bays the other way, two
+#                  intertwined threads; 90 two-way or angled one-way
+#   speed_ramp     flat parking floors and a non-parking speed ramp (p.18, <= 12-14 %, transitions) one aisle wide
+#                  along the edge: small footprints that cannot take a sloped parking floor
+SCHEMES = ("one_bay", "two_ramps", "both_bays", "double_thread", "speed_ramp")
 
-class ModuleLayout(tuple):
-    """(edge i, A, along u, inward n, s0, s1, edge length, modules deep, grade): the sloped module along ring
-    edge i, from s0 to s1 (arc length from A), MODULE_M deep; the ring holds `modules` whole modules inward."""
+
+class GarageLayout(tuple):
+    """(edge i, A, along u, inward n, s0, s1, edge length L, modules, grade, scheme, angle, ucf, module width mw,
+    strips, west levels, east levels, flat levels): strips ((da, db, slabs | None), ...) inward from edge i, slabs
+    ((ha, hb), ...) per storey (None: flat at `flat`); the end bays at the half-levels west / east."""
     __slots__ = ()
 
     def __new__(cls, *v):
@@ -1845,6 +1938,22 @@ class ModuleLayout(tuple):
     L = property(lambda t: t[6])
     modules = property(lambda t: t[7])
     grade = property(lambda t: t[8])
+    scheme = property(lambda t: t[9])
+    angle = property(lambda t: t[10])
+    ucf = property(lambda t: t[11])
+    mw = property(lambda t: t[12])
+    strips = property(lambda t: t[13])
+    west = property(lambda t: t[14])
+    east = property(lambda t: t[15])
+    flat = property(lambda t: t[16])
+
+    @property
+    def dims(self):
+        """(stall width projection, module, vehicle projection, aisle) of its module (CCDC_LAYOUT)."""
+        return CCDC_LAYOUT[(self.ucf, self.angle)]
+
+
+ModuleLayout = GarageLayout
 
 
 def _merge_collinear(ring, tol=MERGE_COLLINEAR_M):
@@ -1870,30 +1979,135 @@ def _merge_collinear(ring, tol=MERGE_COLLINEAR_M):
     return np.array(pts)
 
 
-def _module_layout(ring, storey):
-    """ModuleLayout of the counter-clockwise ring, or None: the edge (longest first) along which two whole modules
-    (the sloped one and a flat one to come back along) and a MODULE_END_M end bay at each end fit inside the ring,
-    with the sloped run no steeper than RAMP_GRADE on any edge, else RAMP_GRADE_MAX."""
+def _depth_fits(ring, a, u, n, L, d0, d1):
+    """The band d0..d1 inward from the edge (a, u, n, L) inside the ring all along it."""
+    return all(_inside(ring, a + u * s + n * d) for s in np.linspace(0.6, L - 0.6, max(9, int(L // 6)))
+               for d in np.linspace(d0 + 0.3, d1 - 0.3, 5))
+
+
+def _scheme_strips(scheme, floors, mods, mw, rw=0.0):
+    """(strips, west, east, flat) of a scheme (see SCHEMES)."""
+    F = floors
+    even = tuple(range(2, 2 * F + 1, 2))
+    up = tuple((2 * k, 2 * k + 2) for k in range(F))
+    down = tuple((2 * k + 2, 2 * k) for k in range(F))
+    if scheme == "speed_ramp":
+        return ((0.0, rw, up),), even, even, even
+    bands = [(j * mw, (j + 1) * mw) for j in range(mods)]
+    if scheme == "one_bay":
+        slabs = [up] + [None] * (mods - 1)
+    elif scheme == "two_ramps":
+        slabs = [up] + [None] * (mods - 2) + [up]
+    elif scheme == "both_bays":
+        a = tuple((2 * k, 2 * k + 1) for k in range(F))
+        b = tuple((2 * k + 2, 2 * k + 1) for k in range(F))
+        slabs = [a if j % 2 == 0 else b for j in range(mods)]
+        return (tuple((d0, d1, s) for (d0, d1), s in zip(bands, slabs)), even, tuple(range(1, 2 * F, 2)), even)
+    else:                                               # double_thread
+        slabs = [up if j % 2 == 0 else down for j in range(mods)]
+    return tuple((d0, d1, s) for (d0, d1), s in zip(bands, slabs)), even, even, even
+
+
+def _ramp_profile(s0, s1, rise):
+    """[(s, fraction of the rise)] along a ramp: straight below TRANSITION_FROM, else a TRANSITION_M at half the
+    grade at each end (p.18)."""
+    R = s1 - s0
+    g = rise / R
+    if g < TRANSITION_FROM or R < 3 * TRANSITION_M:
+        return [(s0, 0.0), (s1, 1.0)]
+    gm = rise / (R - TRANSITION_M)                      # rise = gm (R - 2T) + gm/2 2T
+    f = gm / 2 * TRANSITION_M / rise
+    return [(s0, 0.0), (s0 + TRANSITION_M, f), (s1 - TRANSITION_M, 1.0 - f), (s1, 1.0)]
+
+
+def _garage_layout(ring, storey, floors=4, seed=0.0, edges=4, schemes=SCHEMES):
+    """GarageLayout of the counter-clockwise ring, or None: on the longest edge (of the `edges` longest) where any
+    CCDC scheme fits, one of the schemes that fit there, picked by the seed (then one of its module types);
+    preferring the schemes at or under PARK_RAMP_PREF; a speed ramp when no parking ramp fits."""
     k_ring = len(ring)
     lens = [float(np.hypot(*(ring[(k + 1) % k_ring] - ring[k]))) for k in range(k_ring)]
-    order = sorted(range(k_ring), key=lambda k: -lens[k])
-    for cap in (RAMP_GRADE, RAMP_GRADE_MAX):
+    order = sorted(range(k_ring), key=lambda k: -lens[k])[:edges]
+    types = [(u_, 90) for u_ in (4, 3, 2)] + [(u_, a) for u_ in (4, 3, 2) for a in CCDC_ONE_WAY_ANGLES]
+    for i in order:
+        L = lens[i]
+        a = ring[i]
+        u = (ring[(i + 1) % k_ring] - a) / L
+        n = np.array([-u[1], u[0]])                     # the inside is on the left
+        cands = {}
+        for ucf, ang in types:
+            mw = CCDC_LAYOUT[(ucf, ang)][1]
+            R = L - 2 * mw
+            if R <= 0 or storey / 2 / R > PARK_RAMP_MAX:
+                continue
+            mods = 0
+            while mods < 8 and _depth_fits(ring, a, u, n, L, mods * mw, (mods + 1) * mw):
+                mods += 1
+            if mods < 2:
+                continue
+            for sch, rise in (("one_bay", storey), ("two_ramps", storey), ("both_bays", storey / 2),
+                              ("double_thread", storey)):
+                g = rise / R
+                if g > PARK_RAMP_MAX + 1e-9 or sch not in schemes:
+                    continue
+                if ang != 90 and sch in ("one_bay", "two_ramps"):
+                    continue                            # p.20: those are two-way; one-way never at 90 deg
+                if sch == "two_ramps" and (mods < 3 or L < LONG_GARAGE_M):
+                    continue
+                if sch == "both_bays" and floors > SINGLE_THREAD_MAX_FLOORS:
+                    continue
+                if sch == "double_thread" and floors < DOUBLE_THREAD_MIN_FLOORS:
+                    continue
+                cands.setdefault(sch, []).append((g, ucf, ang, mw, mods))
+        if cands:
+            pref = {s: [c for c in v if c[0] <= PARK_RAMP_PREF + 1e-9] for s, v in cands.items()}
+            if any(pref.values()):
+                cands = {s: v for s, v in pref.items() if v}
+            names = sorted(cands)
+            sch = names[int(_hash01(seed, "garage scheme") * len(names)) % len(names)]
+            opts = cands[sch]
+            g, ucf, ang, mw, mods = opts[int(_hash01(seed, "garage module") * len(opts)) % len(opts)]
+            strips, west, east, flat = _scheme_strips(sch, floors, mods, mw)
+            return GarageLayout(i, a, u, n, mw, L - mw, L, mods, g, sch, ang, ucf, mw, strips, west, east, flat)
+    for cap in (SPEED_RAMP_MAX, SPEED_RAMP_MAX2) if "speed_ramp" in schemes else ():   # a speed ramp (p.18)
         for i in order:
             L = lens[i]
-            s0, s1 = MODULE_END_M, L - MODULE_END_M
-            if s1 - s0 <= 0 or storey / (s1 - s0) > cap + 1e-9:
-                break                           # (the rest are shorter)
+            s0, s1 = SPEED_END_M, L - SPEED_END_M
+            if s1 - s0 < 3 * TRANSITION_M:
+                continue
+            prof = _ramp_profile(s0, s1, storey)
+            g = max((f1 - f0) * storey / (t1 - t0) for (t0, f0), (t1, f1) in zip(prof, prof[1:]))
+            if g > cap + 1e-9:
+                continue
             a = ring[i]
             u = (ring[(i + 1) % k_ring] - a) / L
-            n = np.array([-u[1], u[0]])         # the inside is on the left
-            mods = 0
-            while mods < 8 and all(_inside(ring, a + u * s + n * d)
-                                   for s in np.linspace(0.6, L - 0.6, max(9, int(L // 6)))
-                                   for d in np.linspace(mods * MODULE_M + 0.6, (mods + 1) * MODULE_M - 0.3, 5)):
-                mods += 1
-            if mods >= 2:
-                return ModuleLayout(i, a, u, n, s0, s1, L, mods, storey / (s1 - s0))
+            n = np.array([-u[1], u[0]])
+            ucf = (4, 3, 2)[int(_hash01(seed, "garage module") * 3) % 3]
+            mw = CCDC_LAYOUT[(ucf, 90)][1]
+            rw = END_AISLE_M
+            if not (_depth_fits(ring, a, u, n, L, 0.0, rw) and _depth_fits(ring, a, u, n, L, rw, rw + mw)):
+                continue
+            strips, west, east, flat = _scheme_strips("speed_ramp", floors, 1, mw, rw)
+            return GarageLayout(i, a, u, n, s0, s1, L, 1, g, "speed_ramp", 90, ucf, mw, strips, west, east, flat)
     return None
+
+
+def _module_layout(ring, storey, floors=4, seed=0.0):
+    """(the earlier name)"""
+    return _garage_layout(ring, storey, floors, seed)
+
+
+def _clip(poly, p, nrm, c):
+    """Sutherland-Hodgman: the part of poly with (x - p) . nrm >= c."""
+    out = []
+    k = len(poly)
+    for j in range(k):
+        a, b = poly[j], poly[(j + 1) % k]
+        fa, fb = float((a - p) @ nrm) - c, float((b - p) @ nrm) - c
+        if fa >= 0:
+            out.append(a)
+        if (fa >= 0) != (fb >= 0):
+            out.append(a + (b - a) * (fa / (fa - fb)))
+    return out
 
 
 def _slab(m, top, thick, mat, uvp):
@@ -1927,42 +2141,218 @@ def _sloped_wall(m, p, q, zp, zq, h, mat, t=0.2, sink=0.1):
     m.quad(*[(*c[j], zb[j]) for j in (3, 2, 1, 0)], *uv, mat)
 
 
+def _valid_poly(poly):
+    """A simple polygon the ear clipping triangulates whole (Sutherland-Hodgman leaves a non-convex ring's parts
+    joined by bridges along the cut line: not simple)."""
+    k = len(poly)
+    if k < 3:
+        return False
+    tri = triangulate(poly)
+    if len(tri) != k - 2:
+        return False
+    tri = np.asarray(tri, np.int64).reshape(-1, 3)
+    a = poly[tri]
+    e1, e2 = a[:, 1] - a[:, 0], a[:, 2] - a[:, 0]
+    tot = np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]).sum() / 2
+    return abs(tot - abs(_area2(poly)) / 2) < 1e-3 * max(1.0, tot)
+
+
+def _clip_all(ring, planes):
+    """The ring cut by the half-planes [(nrm, c)] ((x - A) . nrm >= c with A = planes' origin): [polygon], one
+    simple polygon when that is, else the convex parts of the ring's triangles."""
+    A, cuts = planes
+    pts = [np.asarray(p, np.float64) for p in ring]
+    p = pts
+    for nrm, c in cuts:
+        p = _clip(p, A, nrm, c)
+    p = _dedup(p)
+    if len(p) >= 3 and _valid_poly(np.array(p)):
+        return [np.array(p)]
+    out = []
+    for a, b, c_ in np.asarray(triangulate(np.array(pts)), np.int64).reshape(-1, 3):
+        q = [pts[a], pts[b], pts[c_]]
+        for nrm, c in cuts:
+            q = _clip(q, A, nrm, c)
+        q = _dedup(q)
+        if len(q) >= 3 and abs(_area2(np.array(q))) > 1e-4:
+            out.append(np.array(q))
+    return out
+
+
+def _dedup(p, tol=1e-3):
+    """The polygon without consecutive near-duplicate points."""
+    out = []
+    for q in p:
+        if not out or float(np.hypot(*(q - out[-1]))) > tol:
+            out.append(q)
+    while len(out) > 1 and float(np.hypot(*(out[0] - out[-1]))) <= tol:
+        out.pop()
+    return out
+
+
+def _garage_pieces(ring, lay):
+    """The flat deck pieces of a GarageLayout: [(name, [polygon (k, 2)], half-levels)]: the end bays and the
+    middle's parts between the sloped strips (and beyond them)."""
+    A, u, n, s0, s1 = lay.A, lay.u, lay.n, lay.s0, lay.s1
+    out = [("west", _clip_all(ring, (A, [(-u, -s0)])), lay.west), ("east", _clip_all(ring, (A, [(u, s1)])), lay.east)]
+    sloped = sorted((d0, d1) for d0, d1, sl in lay.strips if sl is not None)
+    gaps, d = [], 0.0
+    for d0, d1 in sloped:
+        if d0 > d + 1e-6:
+            gaps.append((d, d0))
+        d = max(d, d1)
+    gaps.append((d, None))
+    for j, (g0, g1) in enumerate(gaps):
+        cuts = [(u, s0), (-u, -s1), (n, g0)] + ([(-n, -g1)] if g1 is not None else [])
+        out.append((f"mid{j}", _clip_all(ring, (A, cuts)), lay.flat))
+    return [(nm, [p for p in ps if abs(_area2(p)) > 1e-3], lv) for nm, ps, lv in out]
+
+
+def _on_outline(ring, p, q, tol=1e-3):
+    """The segment p-q along an edge of the ring."""
+    k = len(ring)
+    for j in range(k):
+        a, b = ring[j], ring[(j + 1) % k]
+        ab = b - a
+        L2 = float(ab @ ab)
+        if L2 < 1e-12:
+            continue
+        ok = True
+        for x in (p, q, (p + q) / 2):
+            t = float(np.clip((x - a) @ ab / L2, 0.0, 1.0))
+            if float(np.hypot(*(x - a - ab * t))) > tol:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def _surface_at(lay, s_end, d, h):
+    """Whether a sloped strip at depth d ends (s_end 0: at s0, 1: at s1) at half-level h, or a flat part of the
+    middle lies there at h."""
+    for d0, d1, sl in lay.strips:
+        if d0 - 1e-6 <= d <= d1 + 1e-6 and sl is not None:
+            return any((hb if s_end else ha) == h for ha, hb in sl)
+    return h in lay.flat
+
+
+def garage_levels(lay, storey, z0):
+    """The height of each half-level."""
+    return lambda h: z0 + h * storey / 2
+
+
 def _module_floors(m, ring, floors, storey, lay, z0, mat, uvp):
-    """The drivable structure of a module garage (closed slabs and parapets): the ground deck, decks 1..floors
-    with the sloped module's strip cut out between its end bays, one sloped slab per storey in that strip, low
-    parapets. Returns the decks' heights."""
-    i, A, u, n, s0, s1 = lay[:6]
-    D = MODULE_M
-    k_ring = len(ring)
-    zs = [z0 + k * storey for k in range(floors + 1)]
+    """The drivable structure of a CCDC garage (closed slabs and parapets): the whole ground deck; each flat piece
+    (_garage_pieces) at each of its half-levels; each sloped strip's slab per storey (with transitions on a speed
+    ramp); low parapets round the outline, along the sloped strips and wherever a deck piece ends at a drop.
+    Returns the decks' heights (whole storeys)."""
+    A, u, n, s0, s1 = lay.A, lay.u, lay.n, lay.s0, lay.s1
+    zh = garage_levels(lay, storey, z0)
+    zs = [zh(2 * k) for k in range(floors + 1)]
+    top_h = 2 * floors
 
     def at(s, d):
         return A + u * s + n * d
 
+    def sd(p):
+        r = p - A
+        return float(r @ u), float(r @ n)
+
     _slab(m, [(p[0], p[1], zs[0]) for p in ring], DECK_SLAB_M, mat, uvp)
-    well = [at(s0, 0.0), at(s0, D), at(s1, D), at(s1, 0.0)]
-    pts = [A] + well + [ring[(i + 1 + j) % k_ring] for j in range(k_ring - 1)]
-    for k in range(1, floors + 1):
-        z = zs[k]
-        _slab(m, [(p[0], p[1], z) for p in pts], DECK_SLAB_M, mat, uvp)
-        for j in range(len(pts)):
-            if not (1 <= j <= 3):               # round the outline (the well's edges below)
-                _sloped_wall(m, pts[j], pts[(j + 1) % len(pts)], z, z, DECK_PARAPET_M, mat)
-        if k == floors:                         # nothing leaves the top deck: the drop to the last ramp's foot
-            _sloped_wall(m, at(s0 - 0.1, 0.0), at(s0 - 0.1, D), z, z, DECK_PARAPET_M, mat)
-    for k in range(floors + 1):                 # the flat module's edge along the sloped one, every deck
-        _sloped_wall(m, at(s0, D + 0.1), at(s1, D + 0.1), zs[k], zs[k], DECK_PARAPET_M, mat)
-    for k in range(floors):                     # the sloped module: s0 at deck k up to s1 at deck k + 1
-        za, zb = zs[k], zs[k + 1]
-        _slab(m, [(*at(s0, 0.0), za), (*at(s1, 0.0), zb), (*at(s1, D), zb), (*at(s0, D), za)], DECK_SLAB_M, mat, uvp)
-        for d in (RAMP_PARAPET_IN_M, D - RAMP_PARAPET_IN_M):
-            _sloped_wall(m, at(s0, d), at(s1, d), za, zb, DECK_PARAPET_M, mat)
+    for name, polys, levels in _garage_pieces(ring, lay):
+        for poly in polys:
+            for h in levels:
+                if h <= 0 or h > top_h:
+                    continue
+                z = zh(h)
+                _slab(m, [(p[0], p[1], z) for p in poly], DECK_SLAB_M, mat, uvp)
+                k = len(poly)
+                for j in range(k):
+                    p, q = poly[j], poly[(j + 1) % k]
+                    (sp, dp), (sq, dq) = sd(p), sd(q)
+                    inward = np.array([-(q - p)[1], (q - p)[0]])
+                    inward = inward / max(float(np.hypot(*inward)), 1e-9) * 0.1
+                    if abs(sp - s0) < 1e-4 and abs(sq - s0) < 1e-4 or abs(sp - s1) < 1e-4 and abs(sq - s1) < 1e-4:
+                        end = 0 if abs(sp - s0) < 1e-4 else 1
+                        s_line = s0 if end == 0 else s1
+                        cuts = sorted({dp, dq} | {c for d0, d1, _ in lay.strips for c in (d0, d1)
+                                                  if min(dp, dq) < c < max(dp, dq)})
+                        for c0, c1 in zip(cuts, cuts[1:]):
+                            mid_d = (c0 + c1) / 2
+                            if name in ("west", "east"):
+                                ok = _surface_at(lay, end, mid_d, h)
+                            else:
+                                ok = h in (lay.west if end == 0 else lay.east)
+                            if not ok:
+                                _sloped_wall(m, at(s_line, c0) + inward, at(s_line, c1) + inward, z, z,
+                                             DECK_PARAPET_M, mat)
+                    elif abs(dp - dq) < 1e-4 and s0 - 1e-4 <= min(sp, sq) and max(sp, sq) <= s1 + 1e-4 \
+                            and any(abs(dp - c) < 1e-4 for d0, d1, sl in lay.strips if sl is not None for c in (d0, d1)):
+                        _sloped_wall(m, p + inward, q + inward, z, z, DECK_PARAPET_M, mat)      # beside a ramp
+                    elif _on_outline(ring, p, q):
+                        _sloped_wall(m, p, q, z, z, DECK_PARAPET_M, mat)                    # round the outline
+    for d0, d1, sl in lay.strips:                       # the sloped strips: a slab per storey, parapets both sides
+        if sl is None:
+            continue                                    # (part of the flat middle pieces)
+        for ha, hb in sl:
+            za, zb = zh(ha), zh(hb)
+            prof = _ramp_profile(s0, s1, 1.0) if lay.scheme == "speed_ramp" else [(s0, 0.0), (s1, 1.0)]
+            for (ta, fa), (tb, fb) in zip(prof, prof[1:]):
+                z_a, z_b = za + (zb - za) * fa, za + (zb - za) * fb
+                _slab(m, [(*at(ta, d0), z_a), (*at(tb, d0), z_b), (*at(tb, d1), z_b), (*at(ta, d1), z_a)],
+                      DECK_SLAB_M, mat, uvp)
+                for d in (d0 + RAMP_PARAPET_IN_M, d1 - RAMP_PARAPET_IN_M):
+                    _sloped_wall(m, at(ta, d), at(tb, d), z_a, z_b, DECK_PARAPET_M, mat)
     return zs
 
 
+def module_columns(ring, lay):
+    """The interior columns' centres: on each line between modules (between back-to-back stall rows), about every
+    COLUMN_EVERY_STALLS stalls (p.63) from s0 to s1; never in an aisle, none in the end bays."""
+    wp = lay.dims[0]
+    own = {c for d0, d1, _ in lay.strips for c in (d0, d1)}
+    if lay.scheme == "speed_ramp":                  # its own edge is the ramp's parapet; its modules beyond
+        own = {lay.strips[0][1] + j * lay.mw for j in range(1, lay.modules + 1)}
+    beyond = {max(own) + j * lay.mw for j in range(1, 8)}         # the module grid carried on into an L's leg
+    out = []
+    nseg = max(1, int(round((lay.s1 - lay.s0) / (COLUMN_EVERY_STALLS * wp))))
+    for c in sorted(own | beyond):
+        if c < 1e-6:
+            continue
+        ts = np.linspace(lay.s0, lay.s1, nseg + 1)
+        for t in (ts if c in own else ts[1:-1]):    # (the leg's columns clear of the end bays' edges)
+            p = lay.A + lay.u * t + lay.n * c
+            if _inside(ring, p) and _inside(ring, p + lay.n * 1.0) and _inside(ring, p - lay.n * 1.0):
+                out.append(p)
+    return out
+
+
+def garage_stalls(lay):
+    """The stall lines of a GarageLayout's middle strips (for plans and tests): [(p, q)] each a stall's side line,
+    from the module's outer edge across its vehicle projection, at its angle; and the aisles [(d0, d1)]."""
+    wp, mw, vp, aw = lay.dims
+    lines, aisles = [], []
+    rows = [(d0, d1, 1.0 if not sl or sl[0][1] >= sl[0][0] else -1.0) for d0, d1, sl in lay.strips
+            if d1 - d0 > mw - 0.5]
+    if lay.scheme == "speed_ramp":
+        rows = [(lay.strips[0][1] + j * mw, lay.strips[0][1] + (j + 1) * mw, 1.0) for j in range(lay.modules)]
+    ang = math.radians(lay.angle)
+    for d0, d1, lean in rows:                       # (angled stalls lean with their one-way traffic)
+        aisles.append((d0 + vp, d1 - vp))
+        for side, e, sgn in ((0, d0, 1.0), (1, d1, -1.0)):
+            s = lay.s0 + ROW_BUFFER_M
+            while s + wp <= lay.s1 - ROW_BUFFER_M:
+                p = lay.A + lay.u * s + lay.n * e
+                tip = p + lay.n * (sgn * vp) + lay.u * (lean * vp / math.tan(ang) if lay.angle != 90 else 0.0)
+                lines.append((p, tip))
+                s += wp
+    return lines, aisles
+
+
 def _module_deck(m, spec, gmin, gmax, mat_idx, ring, floors, storey, lay):
-    """The module garage (see MODULE_M): its floors, skin, perimeter columns and interior columns on the module
-    lines between back-to-back stalls (never in a lane, none in the end bays where the cars turn)."""
+    """The CCDC garage: its floors, skin, perimeter columns and interior columns on the module lines between
+    back-to-back stall rows (never in an aisle, none in the end bays where the cars turn)."""
     mat = mat_idx[f"{PANEL}|{len(WALL_TINTS[PANEL]) - 1 - int(_hash01(spec.seed, 'deck') * 2)}"]
 
     def uvp(p):
@@ -1990,37 +2380,29 @@ def _module_deck(m, spec, gmin, gmax, mat_idx, ring, floors, storey, lay):
         _box(m, c, lay.u, 0.25, 0.25, zs[0] - FOUNDATION_M, zs[-1], mat)
 
 
-def module_columns(ring, lay):
-    """The interior columns' centres: on each line between modules (between back-to-back stalls), every
-    ~DECK_COLUMN_M from s0 to s1."""
-    out = []
-    nseg = max(1, int(round((lay.s1 - lay.s0) / DECK_COLUMN_M)))
-    for j in range(1, lay.modules):
-        for t in np.linspace(lay.s0, lay.s1, nseg + 1):
-            c = lay.A + lay.u * t + lay.n * (j * MODULE_M)
-            if _inside(ring, c):
-                out.append(c)
-    return out
+def garage_floors(height):
+    """(floors, storey) for a mapped height: the standard's floor-to-floor (STOREY_STD_M, p.21), the floor count
+    fitted to the mapped height; the storey stretched up to STOREY_MAX_M where the count would fall short."""
+    floors = max(1, int(round(height / STOREY_STD_M)))
+    storey = STOREY_STD_M
+    if floors * storey < height - STOREY_STD_M / 2 and height / floors <= STOREY_MAX_M:
+        storey = height / floors
+    return floors, storey
 
 
 def deck_plan(spec, gmin, gmax):
-    """(counter-clockwise ring, floors, storey height, _deck_layout) of a parking structure drawn as open decks, or
-    None (not a garage, ground too uneven, storeys too low, the ramp does not fit: a closed box)."""
+    """(counter-clockwise ring, floors, storey height, layout) of a parking structure drawn as open decks, or None
+    (not a garage, ground too uneven, the ramp does not fit: a closed box). The layout is a GarageLayout (CCDC
+    modules, see SCHEMES) or the old switchback (_deck_layout) on footprints too small for any of them."""
     if not spec.deck or gmax - gmin > DECK_LEVEL_M or not spec.height or (spec.min_h or 0.0) > 0.5:
         return None
-    floors = max(1, int(spec.floors or 1))
-    storey = spec.height / floors
-    if storey < DECK_HEADROOM_M:                # split levels counted as floors (10 in 20.8 m): whole decks
-        floors = max(1, int(spec.height // DECK_STOREY_M))
-        storey = spec.height / floors
-    if storey < DECK_HEADROOM_M:
-        return None
+    floors, storey = garage_floors(spec.height)
     ring = np.asarray(spec.ring, np.float64)
     if _area2(ring) < 0:
         ring = ring[::-1]
     simple = _merge_collinear(ring)
-    mod = _module_layout(simple, storey)
-    if mod is not None:                         # parking modules, a whole one sloped (MODULE_M)
+    mod = _garage_layout(simple, storey, floors, spec.seed)
+    if mod is not None:
         return simple, floors, storey, mod
     lay = _deck_layout(ring, storey)            # too small for that: the two-lane switchback along one wall
     return None if lay is None else (ring, floors, storey, lay)
@@ -2031,7 +2413,7 @@ def _parking_deck(m, spec, gmin, gmax, mat_idx):
     plan_ = deck_plan(spec, gmin, gmax)
     if plan_ is None:
         return False
-    if isinstance(plan_[3], ModuleLayout):
+    if isinstance(plan_[3], GarageLayout):
         _module_deck(m, spec, gmin, gmax, mat_idx, *plan_)
         return True
     ring, floors, storey, (i, A, u, n, s0, s1) = plan_
@@ -2048,51 +2430,47 @@ def _parking_deck(m, spec, gmin, gmax, mat_idx):
         return (float(p[0]) / 4.0, float(p[1]) / 4.0)
 
     k_ring = len(ring)
-    m.poly([(p[0], p[1], zs[0]) for p in ring], [uvp(p) for p in ring], mat)          # the ground deck, whole
+    _slab(m, [(p[0], p[1], zs[0]) for p in ring], DECK_SLAB_M, mat, uvp)          # the ground deck, whole
     if gmax - gmin > 0.05:                      # its plinth down to the lowest ground (a sloping street)
         for j in range(k_ring):
             p, q = ring[j], ring[(j + 1) % k_ring]
-            m.quad((p[0], p[1], gmin - FOUNDATION_M), (q[0], q[1], gmin - FOUNDATION_M), (q[0], q[1], zs[0]),
-                   (p[0], p[1], zs[0]), (0, 0), (1, 0), (1, 0.1), (0, 0.1), mat)
+            m.quad((p[0], p[1], gmin - FOUNDATION_M), (q[0], q[1], gmin - FOUNDATION_M),
+                   (q[0], q[1], zs[0] - DECK_SLAB_M), (p[0], p[1], zs[0] - DECK_SLAB_M),
+                   (0, 0), (1, 0), (1, 0.1), (0, 0.1), mat)
     # the upper decks: the ring with the ramp well (both lanes, s0..s1) cut in from the longest edge
     well = [at(s0, 0.0), at(s0, depth), at(s1, depth), at(s1, 0.0)]
     pts = [A] + well + [ring[(i + 1 + j) % k_ring] for j in range(k_ring - 1)]
     for k in range(1, floors + 1):
         z = zs[k]
-        m.poly([(p[0], p[1], z) for p in pts], [uvp(p) for p in pts], mat)
-        m.poly([(p[0], p[1], z - DECK_SLAB_M) for p in pts[::-1]], [uvp(p) for p in pts[::-1]], mat)
+        _slab(m, [(p[0], p[1], z) for p in pts], DECK_SLAB_M, mat, uvp)
         for j in range(len(pts)):
-            p, q = pts[j], pts[(j + 1) % len(pts)]
-            m.quad((p[0], p[1], z - DECK_SLAB_M), (q[0], q[1], z - DECK_SLAB_M), (q[0], q[1], z), (p[0], p[1], z),
-                   (0, 0), (1, 0), (1, 0.1), (0, 0.1), mat)
             if not (1 <= j <= 3):               # the parapet, not round the well (below)
-                _deck_wall(m, p, q, z, z + DECK_PARAPET_M, mat)
+                _sloped_wall(m, pts[j], pts[(j + 1) % len(pts)], z, z, DECK_PARAPET_M, mat)
         # round the well: its inner side and the end away from the ramps' landing (ramp k - 1 comes up at s1 when
         # k - 1 is even, and ramp k leaves from that same end); the top deck has no ramp leaving: its lane closed
         land = s1 if (k - 1) % 2 == 0 else s0
         far = s0 if land == s1 else s1
-        _deck_wall(m, at(s0, depth), at(s1, depth), z, z + DECK_PARAPET_M, mat)
-        _deck_wall(m, at(far, 0.0), at(far, depth), z, z + DECK_PARAPET_M, mat)
+        _sloped_wall(m, at(s0, depth + 0.1), at(s1, depth + 0.1), z, z, DECK_PARAPET_M, mat)
+        _sloped_wall(m, at(far, 0.0), at(far, depth), z, z, DECK_PARAPET_M, mat)
         if k == floors:
             d_free = e + (k % 2) * W
-            _deck_wall(m, at(land, d_free), at(land, d_free + W), z, z + DECK_PARAPET_M, mat)
-    # the ramps: ramp k from deck k to deck k + 1 on lane k % 2, even ones climbing from s0 to s1, walled both sides
+            _sloped_wall(m, at(land, d_free), at(land, d_free + W), z, z, DECK_PARAPET_M, mat)
+    # the ramps: ramp k from deck k to deck k + 1 on lane k % 2, even ones climbing from s0 to s1, walled both sides,
+    # with p.18's half-grade transitions at both ends
+    prof = _ramp_profile(s0, s1, 1.0)
     for k in range(floors):
         d0 = e + (k % 2) * W
-        sa, sb = (s0, s1) if k % 2 == 0 else (s1, s0)
         za, zb = zs[k], zs[k + 1]
-        top = [(at(sa, d0), za), (at(sb, d0), zb), (at(sb, d0 + W), zb), (at(sa, d0 + W), za)]
-        if sb < sa:                             # counter-clockwise seen from above
-            top = top[::-1]
-        quad = [(p[0], p[1], z) for p, z in top]
-        m.quad(*quad, (0, 0), (1, 0), (1, 1), (0, 1), mat)
-        m.quad(*[(x, y, z - DECK_SLAB_M) for x, y, z in quad[::-1]], (0, 0), (1, 0), (1, 1), (0, 1), mat)
-        for d in (d0, d0 + W):
-            steps = 6
-            for j in range(steps):
-                f0, f1 = j / steps, (j + 1) / steps
-                ca, cb = at(sa + (sb - sa) * f0, d), at(sa + (sb - sa) * f1, d)
-                _deck_wall(m, ca, cb, za + (zb - za) * f0, za + (zb - za) * f1 + DECK_PARAPET_M, mat, 0.15)
+        if k % 2 == 1:                          # climbing from s1 to s0: the same profile mirrored
+            segs = [(s0 + s1 - tb, s0 + s1 - ta, za + (zb - za) * fb, za + (zb - za) * fa)
+                    for (ta, fa), (tb, fb) in zip(prof, prof[1:])]
+        else:
+            segs = [(ta, tb, za + (zb - za) * fa, za + (zb - za) * fb) for (ta, fa), (tb, fb) in zip(prof, prof[1:])]
+        for ta, tb, z_a, z_b in segs:
+            _slab(m, [(*at(ta, d0), z_a), (*at(tb, d0), z_b), (*at(tb, d0 + W), z_b), (*at(ta, d0 + W), z_a)],
+                  DECK_SLAB_M, mat, uvp)
+            for d in (d0 + 0.1, d0 + W - 0.1):
+                _sloped_wall(m, at(ta, d), at(tb, d), z_a, z_b, DECK_PARAPET_M, mat, 0.15)
     _garage_skin(m, spec, ring, zs, i, mat_idx)
     # the columns: round the outline every DECK_COLUMN_M, from the foundation to the top deck
     for j in range(k_ring):
@@ -3379,7 +3757,8 @@ def garage_sound_boxes(items, x0, y0, kind):
         if deck_plan(spec, gmin, gmax) is None:
             continue
         c, u, hl, hw = oriented_box(spec.ring)
-        z0, z1 = gmin - 0.5, gmax + spec.height + 1.0
+        _, fl, st, _ = deck_plan(spec, gmin, gmax)
+        z0, z1 = gmin - 0.5, gmax + max(spec.height, fl * st) + 1.5
         out += [float(kind), round(float(c[0]) + x0, 2), round(float(c[1]) + y0, 2), round((z0 + z1) / 2, 2),
                 round(2 * float(hl), 2), round(2 * float(hw), 2), round(z1 - z0, 2),
                 round(math.atan2(float(u[1]), float(u[0])), 4)]
