@@ -420,9 +420,11 @@ class ParkingDeckTest(unittest.TestCase):
                     continue
                 self.assertIn(lay.angle, bld.CCDC_ONE_WAY_ANGLES)
                 self.assertIn(lay.scheme, ("both_bays",), "p.20: one-way never at 90, angled one-way")
-        self.assertGreaterEqual(len({s for s, _ in seen}), 2, seen)
-        self.assertIn(("flat_bays", 90), seen)
-        self.assertTrue(any(a != 90 for _, a in seen) and any(a == 90 for _, a in seen), seen)
+        self.assertIn(("flat_bays", 90), seen, "the ramp pair wherever it fits (Jon: near-universal)")
+        _, (_, _, _, lay) = self.module_garage(80, 45, 9.1)
+        self.assertEqual(lay.scheme, "flat_bays", "a full storey over 80 - 2 x 33' at <= 6.67 %")
+        _, (_, _, _, lay) = self.module_garage(60, 45, 9.1)
+        self.assertNotEqual(lay.scheme, "flat_bays", "too short for it: the half-storey or speed-ramp fallbacks")
 
     def test_every_scheme_closed_drivable_with_headroom(self):
         for scheme in bld.SCHEMES:
@@ -462,18 +464,51 @@ class ParkingDeckTest(unittest.TestCase):
         for floors, d in ((1, 90), (2, 40), (5, 60), (3, 160), (5, 140)):
             ring, floors, storey, lay = self.forced("flat_bays", 160, d, floors)
             kinds = [sl is None for _, _, sl in lay.strips]
-            wb = (lay.modules - 2) // 2
-            want = [True] * wb + [False, False] + [True] * (lay.modules - 2 - wb)
-            self.assertEqual(kinds, want, "wings round the ramp pair")
+            self.assertIn(kinds, ([False, False], [False, False, True], [True, False, False, True]),
+                          "the ramp pair, a wing on the A side, then both")
+            self.assertAlmostEqual(max(d1 for _, d1, _ in lay.strips), d, delta=1e-6, msg="wings out to the wall")
             jb = kinds.index(False)
             (_, _, b), (_, _, a) = lay.strips[jb], lay.strips[jb + 1]
             self.assertTrue(all(hb > ha for ha, hb in a) and all(hb < ha for ha, hb in b), "opposite ways")
             self.assertTrue(all(h % 2 == 0 for h in lay.west + lay.east + lay.flat), "whole floors only")
             zs, (P, UV, T, M, C) = self.module_floors((ring, floors, storey, lay))
             self.assertEqual(self.unbalanced(P, T), 0)
-            self.assertEqual(drive_check(P, T, lay, storey), [])
+            self.assertEqual(drive_check(P, T, lay, storey, ring=ring), [])
             ups = [s for s in bld.garage_drive(lay) if s[0] == "up"]
             self.assertEqual(len(ups), floors, "one ramp per storey, a single loop")
+
+    def test_flat_bays_cross_wings(self):
+        # Jon 2026-10-28: wings any width, rows across (perpendicular to the ramps) to the walls off a spine aisle
+        ring, floors, storey, lay = self.forced("flat_bays", 120, 150, 3)
+        wings = bld.flat_bays_wings(lay)
+        self.assertEqual(sorted(k for *_, k in wings), ["cross", "cross"], "wide: cross wings both sides")
+        lines, spines, cross = bld._wing_lines(lay)
+        self.assertTrue(cross and lines)
+        self.assertTrue(all(abs(float((q - p) @ lay.n)) < 1e-6 for p, q in lines), "stall lines along the ramps: rows across")
+        far = max(max(e0, e1) for _, _, e0, e1 in cross)
+        self.assertAlmostEqual(far, max(d1 for _, d1, _ in lay.strips), delta=1e-6, msg="cross aisles out to the wall")
+        zs, (P, UV, T, M, C) = self.module_floors((ring, floors, storey, lay))
+        self.assertEqual(self.unbalanced(P, T), 0)
+        self.assertEqual(drive_check(P, T, lay, storey, ring=ring), [])
+        paint = bld.garage_paint(ring, lay)
+        self.assertGreater(sum(1 for p, q, _ in paint if abs(float((q - p) @ lay.n)) < 1e-6), 0.9 * len(lines))
+        cols = np.array(bld.module_columns(ring, lay))
+        for c0, c1, e0, e1 in cross:
+            s_, d_ = (cols - lay.A) @ lay.u, (cols - lay.A) @ lay.n
+            self.assertFalse(np.any((s_ > c0 - 0.25) & (s_ < c1 + 0.25) & (d_ > e0) & (d_ < e1)), "a column in a cross aisle")
+        ring, floors, storey, lay = self.forced("flat_bays", 160, 55, 3)
+        self.assertEqual([k for *_, k in bld.flat_bays_wings(lay)], ["row"], "1740's one wing: a spine and a row")
+
+    def test_garage_pieces_union(self):
+        # 1740 Technology Dr: one garage mapped as two abutting parts (54 x 35 m each): planned as one
+        a = rect(0, 0, 70, 27)
+        b = rect(0, 27, 70, 27)[::-1]
+        u = bld._union_abutting([a, b])
+        self.assertIsNotNone(u)
+        self.assertAlmostEqual(abs(bld._area2(u)) / 2, 70 * 54, delta=1.0)
+        self.assertIsNone(bld._union_abutting([a, rect(100, 0, 10, 10)]), "apart: not one")
+        c = rect(30, 27, 20, 10)            # a T-junction on a's edge
+        self.assertAlmostEqual(abs(bld._area2(bld._union_abutting([a, c]))) / 2, 70 * 27 + 200, delta=1.0)
 
     def test_flat_bays_preferred_where_it_fits(self):
         for k in range(10):
@@ -503,7 +538,13 @@ class ParkingDeckTest(unittest.TestCase):
                 self.assertGreater(len(cols), 0)
                 d, s = (cols - lay.A) @ lay.n, (cols - lay.A) @ lay.u
                 frac = np.mod(d, lay.mw)
-                self.assertTrue(np.all(np.minimum(frac, lay.mw - frac) < 0.01), "on the lines between stall rows")
+                online = np.minimum(frac, lay.mw - frac) < 0.01
+                if scheme == "flat_bays":
+                    ramp_d = [c for d0, d1, sl in lay.strips if sl for c in (d0, d1)]
+                    cs = bld.flat_bays_cross_modules(lay)
+                    online = np.array([any(abs(x - c) < 0.01 for c in ramp_d) or any(abs(t - c) < 0.01 for c in cs)
+                                       for x, t in zip(d, s)])
+                self.assertTrue(np.all(online), "on the lines between stall rows")
                 self.assertTrue(np.all((s >= lay.s0 - 1e-6) & (s <= lay.s1 + 1e-6)), "none in the end bays")
                 _, aisles = bld.garage_stalls(lay)
                 for a0, a1 in aisles:
@@ -519,7 +560,7 @@ class ParkingDeckTest(unittest.TestCase):
         self.assertIsNotNone(lay)
         cols = np.array(bld.module_columns(ring, lay))
         d = (cols - lay.A) @ lay.n
-        self.assertTrue(np.any(d > max(c for _, c, _ in lay.strips) + 1.0), "columns in the leg")
+        self.assertTrue(np.any((cols[:, 0] > 111.0) & (cols[:, 1] > 46.0)), "columns in the leg")
         zs, (P, UV, T, M, C) = self.module_floors((ring, 4, bld.STOREY_STD_M, lay))
         self.assertEqual(self.unbalanced(P, T), 0)
 
@@ -611,7 +652,7 @@ class ParkingDeckTest(unittest.TestCase):
         self.assertEqual(p[1], 7)
 
 
-def drive_check(P, T, lay, storey, z0=0.03):
+def drive_check(P, T, lay, storey, z0=0.03, ring=None):
     """Drive a flat_bays garage (bld.garage_drive) on its drawn mesh: [problem] (empty: drivable). Up from the ground
     to the top deck and back down; at each ramp end the left/right turn is checked (up: left a flat bay at that floor,
     right the next ramp up; down: left the next ramp down, right the flat bay), every floor reached, grades within
@@ -648,8 +689,17 @@ def drive_check(P, T, lay, storey, z0=0.03):
             pass                                        # (no wing that side: the wall)
         elif lay.strips[flat_side][2] is not None:
             bad.append(f"step {k} {way}: {'left' if way == 'up' else 'right'} is not a flat bay")
-        elif not (has(at(end, mid(flat_side)), zb) and has(at(s_to - head * 3.0, mid(flat_side)), zb)):
-            bad.append(f"step {k}: flat bay not level with the end aisle at {hb}")
+        else:
+            aw = lay.dims[3]
+            f0, f1, _ = lay.strips[flat_side]
+            half = min(aw, f1 - f0) / 2
+            sp = lay.strips[j][1] + half if flat_side > j else lay.strips[j][0] - half       # the wing's spine
+            if not (has(at(end, sp), zb) and has(at(s_to - head * 3.0, sp), zb)):
+                bad.append(f"step {k}: wing not level with the end aisle at {hb}")
+            for c0, c1, e0, e1 in bld._wing_lines(lay)[2]:          # every cross aisle off it, at that floor
+                x = at((c0 + c1) / 2, (e0 + e1) / 2)
+                if ring is not None and bld._inside(np.asarray(ring), x) and not has(x, zb):
+                    bad.append(f"step {k}: cross aisle not level at {hb}")
         nxt = steps[k + 1] if k + 1 < len(steps) else None
         if nxt and nxt[0] == way and nxt[1] != ramp_side:
             bad.append(f"step {k} {way}: next ramp is not on the {'right' if way == 'up' else 'left'}")

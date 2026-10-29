@@ -2132,6 +2132,53 @@ def _scheme_strips(scheme, floors, mods, mw, rw=0.0):
     return tuple((d0, d1, s) for (d0, d1), s in zip(bands, slabs)), even, even, even
 
 
+def _flat_bays_strips(ring, a, u, n, L, mw, strips):
+    """flat_bays strips: the ramp pair (B down, A up, from _scheme_strips) placed across the depth that fits whole
+    along the edge, with a level wing each side as wide as is left (to the walls, any width): (0, dB, None) | B | A |
+    (dA, far wall, None). The wing on the A side alone while what is left is under two modules (1740 Technology Dr)."""
+    ramps = [st for st in strips if st[2] is not None]
+    down, up = ramps[0][2], ramps[1][2]
+    D = 2 * mw
+    while D < 400.0 and _depth_fits(ring, a, u, n, L, D, D + 1.0):
+        D += 1.0
+    far = max(float((np.asarray(p) - a) @ n) for p in ring)
+    W = D - 2 * mw
+    wb = float(np.floor(W / 2)) if W >= 2 * mw else 0.0
+    out = ([(0.0, wb, None)] if wb > 0 else []) + [(wb, wb + mw, down), (wb + mw, wb + 2 * mw, up)]
+    if far > wb + 2 * mw + 0.5:
+        out.append((wb + 2 * mw, far, None))
+    return tuple(out)
+
+
+def flat_bays_wings(lay):
+    """The level wings of a flat_bays layout: [(edge d at the ramp pair, side (+1: d grows away from it), far d,
+    kind)] with kind "cross" (Jon 2026-10-28: rows across, perpendicular to the ramps, out to the walls, their
+    aisles off a spine aisle along the ramp pair) when the wing is a spine and a module deep or more, else "row"
+    (a spine aisle along the ramp and one stall row along the wall, as at 1740 Technology Dr), or "aisle"."""
+    if lay.scheme != "flat_bays":
+        return []
+    wp, mw, vp, aw = lay.dims
+    out = []
+    ramp_d = [c for d0, d1, sl in lay.strips if sl is not None for c in (d0, d1)]
+    for d0, d1, sl in lay.strips:
+        if sl is not None:
+            continue
+        e, side, far = (d1, -1, d0) if d1 <= min(ramp_d) + 1e-6 else (d0, 1, d1)
+        W = abs(far - e)
+        kind = "cross" if W >= aw + mw else "row" if W >= aw + vp else "aisle"
+        out.append((e, side, far, kind))
+    return out
+
+
+def flat_bays_cross_modules(lay):
+    """The s0..s1 module lines of a cross wing: [c0, c1, ..., cK] mw apart, centred (the rest is end aisle)."""
+    wp, mw, vp, aw = lay.dims
+    R = lay.s1 - lay.s0
+    K = int(R // mw)
+    c0 = lay.s0 + (R - K * mw) / 2
+    return [c0 + k * mw for k in range(K + 1)]
+
+
 def _ramp_profile(s0, s1, rise):
     """[(s, fraction of the rise)] along a ramp: straight below TRANSITION_FROM, else a TRANSITION_M at half the
     grade at each end (p.18)."""
@@ -2183,16 +2230,19 @@ def _garage_layout(ring, storey, floors=4, seed=0.0, edges=4, schemes=SCHEMES):
                     continue                            # two-way 90 in four bays at least
                 cands.setdefault(sch, []).append((g, ucf, ang, mw, mods, end))
         if cands:
+            if "flat_bays" in cands:                    # the preferred default wherever it fits (to 6.67 %, p.17)
+                cands = {"flat_bays": cands["flat_bays"]}
             pref = {s: [c for c in v if c[0] <= PARK_RAMP_PREF + 1e-9] for s, v in cands.items()}
             if any(pref.values()):
                 cands = {s: v for s, v in pref.items() if v}
-            if "flat_bays" in cands:                    # the preferred default wherever it fits
-                cands = {"flat_bays": cands["flat_bays"]}
             names = sorted(cands)
             sch = names[int(_hash01(seed, "garage scheme") * len(names)) % len(names)]
             opts = cands[sch]
             g, ucf, ang, mw, mods, end = opts[int(_hash01(seed, "garage module") * len(opts)) % len(opts)]
             strips, west, east, flat = _scheme_strips(sch, floors, mods, mw)
+            if sch == "flat_bays":
+                strips = _flat_bays_strips(ring, a, u, n, L, mw, strips)
+                mods = 2
             return GarageLayout(i, a, u, n, end, L - end, L, mods, g, sch, ang, ucf, mw, strips, west, east, flat)
     for cap in (SPEED_RAMP_MAX, SPEED_RAMP_MAX2) if "speed_ramp" in schemes else ():   # a speed ramp (p.18)
         for i in order:
@@ -2460,6 +2510,20 @@ def module_columns(ring, lay):
     if lay.scheme == "speed_ramp":                  # its own edge is the ramp's parapet; its modules beyond
         own = {lay.strips[0][1] + j * lay.mw for j in range(1, lay.modules + 1)}
     beyond = {max(own) + j * lay.mw for j in range(1, 8)}         # the module grid carried on into an L's leg
+    wing_cols = []
+    if lay.scheme == "flat_bays":                   # the ramp pair's lines; a cross wing's back-to-back row lines
+        own = {c for d0, d1, sl in lay.strips if sl is not None for c in (d0, d1)}
+        beyond = set()
+        wp_, mw_, vp_, aw_ = lay.dims
+        cs = flat_bays_cross_modules(lay)
+        for e, side, far, kind in flat_bays_wings(lay):
+            if kind != "cross":
+                continue
+            for c in cs[1:-1]:
+                d = e + side * (aw_ + COLUMN_EVERY_STALLS * wp_)
+                while side * (far - d) > 1.0:
+                    wing_cols.append(lay.A + lay.u * c + lay.n * d)
+                    d += side * COLUMN_EVERY_STALLS * wp_
     out = []
     nseg = max(1, int(round((lay.s1 - lay.s0) / (COLUMN_EVERY_STALLS * wp))))
     for c in sorted(own | beyond):
@@ -2470,7 +2534,45 @@ def module_columns(ring, lay):
             p = lay.A + lay.u * t + lay.n * c
             if _inside(ring, p) and _inside(ring, p + lay.n * 1.0) and _inside(ring, p - lay.n * 1.0):
                 out.append(p)
+    for p in wing_cols:
+        if all(_inside(ring, p + v) for v in (lay.u, -lay.u, lay.n, -lay.n)):
+            out.append(p)
     return out
+
+
+def _wing_lines(lay, ring=None):
+    """A flat_bays garage's wing stall lines [(p, q)] (90 deg, PAINT_CLEAR_M clear of a column line, 0.2 m of a
+    wall-side end) and the wings' aisles: spines [(d0, d1)] along the ramp pair, cross aisles [(s0, s1, d0, d1)]."""
+    wp, mw, vp, aw = lay.dims
+    lines, spines, cross = [], [], []
+    at = lambda s_, d_: lay.A + lay.u * s_ + lay.n * d_
+    for e, side, far, kind in flat_bays_wings(lay):
+        spines.append(tuple(sorted((e + side * 0.4, e + side * min(aw, abs(far - e))))))   # (off the line's columns)
+        if kind == "cross":
+            cs = flat_bays_cross_modules(lay)
+            K = len(cs) - 1
+            for k, c in enumerate(cs):
+                for dirn in ((1,) if k < K else ()) + ((-1,) if k > 0 else ()):
+                    clear = PAINT_CLEAR_M if 0 < k < K else 0.2
+                    d = e + side * aw
+                    while side * (far - (d + side * wp)) > 0.6:
+                        lines.append((at(c + dirn * clear, d), at(c + dirn * vp, d)))
+                        d += side * wp
+                    lines.append((at(c + dirn * clear, d), at(c + dirn * vp, d)))
+            for c, c2 in zip(cs, cs[1:]):
+                cross.append((c + vp, c2 - vp) + tuple(sorted((e + side * aw, far))))
+        elif kind == "row":                         # the row along the wall, following it (ring given)
+            s_ = lay.s0 + ROW_BUFFER_M
+            while s_ <= lay.s1 - ROW_BUFFER_M + 1e-6:
+                w = far
+                if ring is not None:
+                    while side * (w - e) > aw + vp and not (_inside(ring, at(s_, w - side * 0.65)) and
+                                                            _inside(ring, at(s_ + 0.3, w - side * 0.65))):
+                        w -= side * 0.5
+                if side * (w - e) >= aw + vp:
+                    lines.append((at(s_, w - side * 0.65), at(s_, w - side * vp)))
+                s_ += wp
+    return lines, spines, cross
 
 
 def garage_stalls(lay):
@@ -2479,9 +2581,13 @@ def garage_stalls(lay):
     wp, mw, vp, aw = lay.dims
     lines, aisles = [], []
     rows = [(d0, d1, 1.0 if not sl or sl[0][1] >= sl[0][0] else -1.0) for d0, d1, sl in lay.strips
-            if d1 - d0 > mw - 0.5]
+            if d1 - d0 > mw - 0.5 and (sl is not None or lay.scheme != "flat_bays")]
     if lay.scheme == "speed_ramp":
         rows = [(lay.strips[0][1] + j * mw, lay.strips[0][1] + (j + 1) * mw, 1.0) for j in range(lay.modules)]
+    if lay.scheme == "flat_bays":
+        wl, spines, _ = _wing_lines(lay)
+        lines += wl
+        aisles += spines
     ang = math.radians(lay.angle)
     for d0, d1, lean in rows:                       # (angled stalls lean with their one-way traffic)
         aisles.append((d0 + vp, d1 - vp))
@@ -2582,7 +2688,7 @@ def garage_paint(ring, lay):
         rows = [(r1 + j * mw, r1 + (j + 1) * mw, 1.0, flat_floors) for j in range(lay.modules)]
     else:
         rows = [(d0, d1, 1.0 if not sl or sl[0][1] >= sl[0][0] else -1.0, list(sl) if sl else flat_floors)
-                for d0, d1, sl in lay.strips if d1 - d0 > mw - 0.5]
+                for d0, d1, sl in lay.strips if d1 - d0 > mw - 0.5 and (sl is not None or lay.scheme != "flat_bays")]
     ang = math.radians(lay.angle)
     out = []
 
@@ -2593,6 +2699,11 @@ def garage_paint(ring, lay):
         if _inside(ring, p) and _inside(ring, q) and _inside(ring, (p + q) / 2):
             out.append((p, q, floors))
 
+    if lay.scheme == "flat_bays":                   # the wings: rows across (or along the wall), every floor
+        for p, q in _wing_lines(lay, ring)[0]:
+            far_end = q + (q - p) / max(float(np.hypot(*(q - p))), 1e-9) * 0.3
+            if _inside(ring, far_end):
+                keep(p, q, flat_floors)
     for d0, d1, lean, floors in rows:
         for e, sgn in ((d0, 1.0), (d1, -1.0)):
             n = int((lay.s1 - lay.s0 - 2 * ROW_BUFFER_M) // wp)
@@ -2943,6 +3054,123 @@ def collision_mesh(specs_and_ground):
 
 
 # ------------------------------------------------------------------------------------------- a tile
+
+GARAGE_UNION_TOL_M = 0.3    # m: pieces of one garage closer than this along a shared edge are one deck
+
+
+def _union_abutting(rings, tol=GARAGE_UNION_TOL_M):
+    """One ring (counter-clockwise) of polygons that only touch along shared edges (a garage mapped as abutting parts:
+    1740 Technology Dr's two 54 x 35 m halves), or None when they are not one connected outline (apart, overlapping,
+    or meeting at a corner). Each ring's edges are split at the others' vertices lying on them (T-junctions), vertices
+    within tol merged, the edges walked in both directions by two rings dropped (the shared walls), and the rest
+    must close into one loop."""
+    rs = []
+    for r in rings:
+        r = np.asarray(r, np.float64)[:, :2]
+        if len(r) > 1 and np.hypot(*(r[0] - r[-1])) < 1e-9:
+            r = r[:-1]
+        rs.append(r if _area2(r) > 0 else r[::-1])
+    pts = np.concatenate(rs)
+    canon = []                                      # vertex clusters (first point wins)
+
+    def cid(p):
+        for k, c in enumerate(canon):
+            if abs(c[0] - p[0]) <= tol and abs(c[1] - p[1]) <= tol and np.hypot(*(c - p)) <= tol:
+                return k
+        canon.append(np.asarray(p, np.float64))
+        return len(canon) - 1
+
+    for p in pts:
+        cid(p)
+    edges = {}
+    for r in rs:
+        k = len(r)
+        for j in range(k):
+            a, b = r[j], r[(j + 1) % k]
+            ab = b - a
+            L2 = float(ab @ ab)
+            if L2 < 1e-12:
+                continue
+            on = []
+            for c in canon:                         # vertices on this edge (T-junctions)
+                t = float((c - a) @ ab) / L2
+                if 1e-6 < t < 1 - 1e-6 and np.hypot(*(a + ab * t - c)) <= tol:
+                    on.append((t, c))
+            chain = [cid(a)] + [cid(c) for _, c in sorted(on, key=lambda x: x[0])] + [cid(b)]
+            for x, y in zip(chain, chain[1:]):
+                if x != y:
+                    edges[(x, y)] = edges.get((x, y), 0) + 1
+    if any(v > 1 for v in edges.values()):
+        return None                                 # (overlapping pieces)
+    left = {e for e in edges if (e[1], e[0]) not in edges}
+    if len(left) == sum(len(r) for r in rs) or len(left) < 3:
+        if len(rs) > 1 and len(left) == len(edges):
+            return None                             # nothing shared: apart
+    nxt = {}
+    for x, y in left:
+        if x in nxt:
+            return None                             # (touching at a corner: not one simple outline)
+        nxt[x] = y
+    start = next(iter(nxt))
+    loop, x = [start], nxt[start]
+    while x != start:
+        if x not in nxt or len(loop) > len(nxt):
+            return None
+        loop.append(x)
+        x = nxt[x]
+    if len(loop) != len(nxt):
+        return None                                 # (more than one loop: a hole, or apart)
+    out = np.array([canon[k] for k in loop])
+    total = sum(_area2(r) for r in rs)
+    if abs(_area2(out) - total) > 0.02 * total + 1.0:
+        return None
+    return _merge_collinear(out, 0.05)
+
+
+def _garage_unions(rings, attrs, looks, mins):
+    """Garage pieces (parking-class or garage-covered rings on the ground) that abut along an edge, unioned into one
+    ring each (_union_abutting): the tallest piece's attributes and look, its height."""
+    cand = [k for k, (at, mh) in enumerate(zip(attrs, mins)) if mh <= 0.5 and not at.get("landmark")
+            and (str(at.get("class") or "").lower() in ("parking", "parking_garage") or at.get("garage"))]
+    if len(cand) < 2:
+        return rings, attrs, looks, mins
+    box = {k: (rings[k].min(0) - 1.0, rings[k].max(0) + 1.0) for k in cand}
+    parent = {k: k for k in cand}
+
+    def root(k):
+        while parent[k] != k:
+            k = parent[k]
+        return k
+
+    for i_, a in enumerate(cand):
+        for b in cand[i_ + 1:]:
+            (a0, a1), (b0, b1) = box[a], box[b]
+            if np.any(a1 < b0) or np.any(b1 < a0) or root(a) == root(b):
+                continue
+            if _union_abutting([rings[a], rings[b]]) is not None:
+                parent[root(b)] = root(a)
+    groups = {}
+    for k in cand:
+        groups.setdefault(root(k), []).append(k)
+    drop, add = set(), []
+    for ks in groups.values():
+        if len(ks) < 2:
+            continue
+        u = _union_abutting([rings[k] for k in ks])
+        if u is None:
+            continue
+        def h(k):
+            v = attrs[k].get("height")
+            return float(v) if v is not None and np.isfinite(v) else 0.0
+        top = max(ks, key=h)
+        drop.update(ks)
+        add.append((u, dict(attrs[top], height=h(top) or attrs[top].get("height")), looks[top], 0.0))
+    if not add:
+        return rings, attrs, looks, mins
+    keep = [k for k in range(len(rings)) if k not in drop]
+    return ([rings[k] for k in keep] + [a[0] for a in add], [attrs[k] for k in keep] + [a[1] for a in add],
+            [looks[k] for k in keep] + [a[2] for a in add], [mins[k] for k in keep] + [a[3] for a in add])
+
 
 def _shared_walls(rings, tol=0.6):
     """Per ring, the number of other rings with a vertex within tol of one of its edges (row houses)."""
@@ -3799,6 +4027,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             z = float(np.asarray(elev(np.array([float(la)]), np.array([float(lo)])), np.float64)[0])
             return float(frame.geodetic_to_enu(float(la), float(lo), z)[2])       # (the decks' frame up)
         rings, attrs, looks, mins = _passages(rings, attrs, looks, mins, bridges_xy, decks, ground_at)
+    rings, attrs, looks, mins = _garage_unions(rings, attrs, looks, mins)     # a garage mapped as abutting pieces
     shared = _shared_walls(rings)
     cover = sum(_area2(r) / 2 for r, mh in zip(rings, mins) if mh <= 0.5) / ((x1 - x0) * (y1 - y0))
     town, dense = cover < TOWN_COVERAGE, cover > BRICK_WALK_COVERAGE
