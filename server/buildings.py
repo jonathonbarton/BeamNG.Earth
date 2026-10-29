@@ -1891,7 +1891,6 @@ CLEAR_M = 8 * FT + 2 * FT / 12              # p.18: 8'-2" structural clear heigh
 STOREY_STD_M = 10 * FT                      # p.21: floor-to-floor ~10' (one 360 deg turn rises 10')
 STOREY_MAX_M = 12 * FT                      # p.11: 12' upper floors (adaptive reuse): the tallest we draw
 SINGLE_THREAD_MAX_FLOORS = 6                # p.21
-DOUBLE_THREAD_MIN_FLOORS = 4                # p.23 recommends 7+; mapped garages are rarely that tall
 LONG_GARAGE_M = 240 * FT                    # p.13 / p.23: an ideal (double-threaded) length
 END_AISLE_M = 26 * FT                       # p.31: an end bay's two-way drive aisle at least
 TURN_OUT_M = 30 * FT                        # p.31: outside turning radius (inside 15')
@@ -1915,11 +1914,25 @@ MERGE_COLLINEAR_M = 0.6     # m off the line through its neighbours a vertex may
 #   two_ramps      the same with the first and last bays sloped (inbound and outbound ramp): long garages
 #   both_bays      single-threaded with sloping floors (p.21): every bay sloped half a storey, the end bays half a
 #                  storey apart, one-way loop; 90 two-way or angled one-way
-#   double_thread  double-threaded (p.23): every bay sloped a whole storey, alternate bays the other way, two
-#                  intertwined threads; 90 two-way or angled one-way
+#   flat_bays      the preferred default (Jon 2026-10-28, after 1740 Technology Dr, San Jose): CCDC's two-way
+#                  double-threaded with flat bays (p.23) without its mid-length crossover. Inward from the edge:
+#                  flat bay | ramp B | ramp A | flat bay (| more flat bays). Ramp A rises a whole storey s0 -> s1 on
+#                  every storey, ramp B a whole storey s1 -> s0, side by side, walled from each other (parapets, no
+#                  crossover). Flat bays and both end bays at every whole floor, so each ramp end meets a full-width
+#                  flat end aisle at exactly its height. Driving: up A (towards s1) the flat bay is on the left (+n),
+#                  ramp B up on the right; up B (towards s0) its flat bay is on the left (-n), A on the right;
+#                  coming down the same ramps the turns swap (left: down again, right: the level's flat bay).
+#                  Near-universal (Jon): two modules is the bare ramp pair (end aisles the only level deck), a third
+#                  a level wing on the A side (as at 1740), more split into wings both sides, any number wide.
+#                  90 deg two-way. Section (along s, one ramp bay; whole storeys, no half levels):
+#                      F  ====end====/                        ====end====
+#                         ====end====\----- B: F -> F-1 -----====end====
+#                         ====end====/----- A: k -> k+1 ------====end====   (A and B drawn on one line: A rises east,
+#                      0  ====end====------ ground (flat bays) ===end====    B rises west, each a full storey)
 #   speed_ramp     flat parking floors and a non-parking speed ramp (p.18, <= 12-14 %, transitions) one aisle wide
 #                  along the edge: small footprints that cannot take a sloped parking floor
-SCHEMES = ("one_bay", "two_ramps", "both_bays", "double_thread", "speed_ramp")
+SCHEMES = ("flat_bays", "one_bay", "two_ramps", "both_bays", "speed_ramp")
+FLAT_BAYS_MIN_MODULES = 2
 
 
 class GarageLayout(tuple):
@@ -2005,8 +2018,9 @@ def _scheme_strips(scheme, floors, mods, mw, rw=0.0):
         b = tuple((2 * k + 2, 2 * k + 1) for k in range(F))
         slabs = [a if j % 2 == 0 else b for j in range(mods)]
         return (tuple((d0, d1, s) for (d0, d1), s in zip(bands, slabs)), even, tuple(range(1, 2 * F, 2)), even)
-    else:                                               # double_thread
-        slabs = [up if j % 2 == 0 else down for j in range(mods)]
+    else:                                               # flat_bays: flat | B (down) | A (up) | flat ...
+        wb = (mods - 2) // 2                            # wings: the A side (left going up A) gets the odd one
+        slabs = [None] * wb + [down, up] + [None] * (mods - 2 - wb)
     return tuple((d0, d1, s) for (d0, d1), s in zip(bands, slabs)), even, even, even
 
 
@@ -2038,17 +2052,17 @@ def _garage_layout(ring, storey, floors=4, seed=0.0, edges=4, schemes=SCHEMES):
         cands = {}
         for ucf, ang in types:
             mw = CCDC_LAYOUT[(ucf, ang)][1]
-            R = L - 2 * mw
-            if R <= 0 or storey / 2 / R > PARK_RAMP_MAX:
+            if L - 2 * SPEED_END_M <= 0 or storey / 2 / (L - 2 * SPEED_END_M) > PARK_RAMP_MAX:
                 continue
             mods = 0
             while mods < 8 and _depth_fits(ring, a, u, n, L, mods * mw, (mods + 1) * mw):
                 mods += 1
             if mods < 2:
                 continue
-            for sch, rise in (("one_bay", storey), ("two_ramps", storey), ("both_bays", storey / 2),
-                              ("double_thread", storey)):
-                g = rise / R
+            for sch, rise in (("flat_bays", storey), ("one_bay", storey), ("two_ramps", storey),
+                              ("both_bays", storey / 2)):
+                end = SPEED_END_M if sch == "flat_bays" else mw    # flat_bays: 33' end aisles (p.31 turn + buffer)
+                g = rise / (L - 2 * end)
                 if g > PARK_RAMP_MAX + 1e-9 or sch not in schemes:
                     continue
                 if ang != 90 and sch in ("one_bay", "two_ramps"):
@@ -2057,19 +2071,21 @@ def _garage_layout(ring, storey, floors=4, seed=0.0, edges=4, schemes=SCHEMES):
                     continue
                 if sch == "both_bays" and floors > SINGLE_THREAD_MAX_FLOORS:
                     continue
-                if sch == "double_thread" and floors < DOUBLE_THREAD_MIN_FLOORS:
-                    continue
-                cands.setdefault(sch, []).append((g, ucf, ang, mw, mods))
+                if sch == "flat_bays" and (ang != 90 or mods < FLAT_BAYS_MIN_MODULES):
+                    continue                            # two-way 90 in four bays at least
+                cands.setdefault(sch, []).append((g, ucf, ang, mw, mods, end))
         if cands:
             pref = {s: [c for c in v if c[0] <= PARK_RAMP_PREF + 1e-9] for s, v in cands.items()}
             if any(pref.values()):
                 cands = {s: v for s, v in pref.items() if v}
+            if "flat_bays" in cands:                    # the preferred default wherever it fits
+                cands = {"flat_bays": cands["flat_bays"]}
             names = sorted(cands)
             sch = names[int(_hash01(seed, "garage scheme") * len(names)) % len(names)]
             opts = cands[sch]
-            g, ucf, ang, mw, mods = opts[int(_hash01(seed, "garage module") * len(opts)) % len(opts)]
+            g, ucf, ang, mw, mods, end = opts[int(_hash01(seed, "garage module") * len(opts)) % len(opts)]
             strips, west, east, flat = _scheme_strips(sch, floors, mods, mw)
-            return GarageLayout(i, a, u, n, mw, L - mw, L, mods, g, sch, ang, ucf, mw, strips, west, east, flat)
+            return GarageLayout(i, a, u, n, end, L - end, L, mods, g, sch, ang, ucf, mw, strips, west, east, flat)
     for cap in (SPEED_RAMP_MAX, SPEED_RAMP_MAX2) if "speed_ramp" in schemes else ():   # a speed ramp (p.18)
         for i in order:
             L = lens[i]
@@ -2210,6 +2226,24 @@ def _garage_pieces(ring, lay):
     return [(nm, [p for p in ps if abs(_area2(p)) > 1e-3], lv) for nm, ps, lv in out]
 
 
+def _ground_pieces(ring, lay):
+    """The ground deck's polygons: the outline less the middle of every sloped strip with a slab rising from the
+    ground (no low-headroom floor running on under a ramp's rising end)."""
+    A, u, n = lay.A, lay.u, lay.n
+    cut = sorted((d0, d1) for d0, d1, sl in lay.strips if sl and any(min(ha, hb) < 2 for ha, hb in sl))
+    if not cut:
+        return [np.asarray(ring, np.float64)]
+    out = _clip_all(ring, (A, [(-u, -lay.s0)])) + _clip_all(ring, (A, [(u, lay.s1)]))
+    d = 0.0
+    for d0, d1 in cut + [(None, None)]:
+        if d0 is None or d0 > d + 1e-6:
+            cuts = [(u, lay.s0), (-u, -lay.s1), (n, d)] + ([(-n, -d0)] if d0 is not None else [])
+            out += _clip_all(ring, (A, cuts))
+        if d1 is not None:
+            d = max(d, d1)
+    return [p for p in out if abs(_area2(p)) > 1e-3]
+
+
 def _on_outline(ring, p, q, tol=1e-3):
     """The segment p-q along an edge of the ring."""
     k = len(ring)
@@ -2261,7 +2295,8 @@ def _module_floors(m, ring, floors, storey, lay, z0, mat, uvp):
         r = p - A
         return float(r @ u), float(r @ n)
 
-    _slab(m, [(p[0], p[1], zs[0]) for p in ring], DECK_SLAB_M, mat, uvp)
+    for poly in _ground_pieces(ring, lay):          # the ground deck, open under any ramp rising from it
+        _slab(m, [(p[0], p[1], zs[0]) for p in poly], DECK_SLAB_M, mat, uvp)
     for name, polys, levels in _garage_pieces(ring, lay):
         for poly in polys:
             for h in levels:
@@ -4736,3 +4771,31 @@ def district_town(frame, tx, ty, md):
         except Exception:           # not cached / unreadable: counts as empty
             continue
     return district_coverage(lat, lon, cells) < WEST_TOWN_COVERAGE
+
+
+def garage_drive(lay):
+    """The flat_bays scheme driven (for checks and plans): [(way, ramp strip index, from half-level, to half-level,
+    heading (+1: towards s1, -1: towards s0), left strip index, right strip index)] up from the ground to the top
+    deck and back down. At each ramp's end the driver turns into the end aisle: left/right are the strips that side
+    of the ramp (+n is left heading +u). Up: left is a flat bay at that floor, right the next ramp up. Down: left
+    the next ramp down, right the flat bay. None for other schemes."""
+    if lay.scheme != "flat_bays":
+        return None
+    idx = {j: sl for j, (_, _, sl) in enumerate(lay.strips)}
+    ramps = [j for j, sl in idx.items() if sl]
+    steps, h, end = [], 0, 0                        # end: 0 at s0, 1 at s1 (in at the s0 end)
+    top = max(max(a, b) for j in ramps for a, b in idx[j])
+    while h < top:                                  # up: the ramp whose low end is here at h
+        j, (ha, hb) = next((j, ab) for j in ramps for ab in idx[j] if ab[end] == h and ab[1 - end] > h)
+        head = 1 if hb > ha else -1
+        left, right = j + head, j - head            # +n (j + 1) is left heading +u
+        steps.append(("up", j, h, max(ha, hb), head, left, right))
+        h, end = max(ha, hb), 1 - end
+    while h > 0:                                    # down: the ramp whose high end is here at h
+        j, (ha, hb) = next((j, ab) for j in ramps for ab in idx[j] if ab[end] == h and ab[1 - end] < h)
+        end = 1 - end
+        head = 1 if hb < ha else -1
+        left, right = j + head, j - head
+        steps.append(("down", j, h, min(ha, hb), head, left, right))
+        h = min(ha, hb)
+    return steps
