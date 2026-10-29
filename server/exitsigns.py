@@ -37,7 +37,8 @@ EXIT_KEYS = ('ref', 'name', 'noref', 'exit_to', 'junction:ref', 'destination',
              'destination:street', 'destination:ref', 'destination:ref:to',
              'destination:forward', 'destination:backward', 'destination:street:forward',
              'destination:street:backward', 'destination:ref:forward', 'destination:ref:backward',
-             'destination:lanes', 'destination:ref:lanes')
+             'destination:lanes', 'destination:ref:lanes', 'destination:symbol',
+             'destination:symbol:forward', 'destination:symbol:backward')
 WAY_KEYS = EXIT_KEYS + ('highway', 'oneway', 'lanes', 'lanes:forward', 'lanes:backward',
                        'width', 'bridge', 'layer', 'tunnel', 'access', 'service')
 MATERIALS = ['bne_exit_green', 'bne_exit_white', 'bne_exit_metal', 'bne_exit_letters', 'bne_exit_blue']
@@ -52,8 +53,12 @@ def sign_style(label):
     return 'rest_area' if names and not label['ref'] and all(rest.fullmatch(n) for n in names) else 'exit'
 
 
-def labels(node, ramp, backwards=False):
-    """Keep real posted labels; an interchange name is a last resort, never a city guess."""
+def labels(node, ramp, backwards=False, target=None):
+    """Keep real posted labels; an interchange name is a last resort, never a city guess.
+
+    target: the road the link leads to (index_records: {'ref', 'name', 'cardinal', 'freeway'}), used only
+    when the link and junction carry no destination: a freeway's ref and direction ("I 5 SOUTH"), else
+    the road's name or ref, marked source='target' (posted tags carry no source key)."""
     suffix = ':backward' if backwards else ':forward'
     def get(key):
         return ramp.get(key+suffix, ramp.get(key, ''))
@@ -70,7 +75,41 @@ def labels(node, ramp, backwards=False):
     names = values(get('destination')) or values(get('destination:street'))
     names = names or values(get('destination:lanes')) or values(node.get('exit_to')) or values(node.get('name'))
     routes = values(get('destination:ref')) or values(get('destination:ref:to')) or values(get('destination:ref:lanes'))
-    return dict(ref=ref, names=names[:3], routes=routes[:3]) if ref or names or routes else None
+    source = 'osm' if names or routes else ''
+    if not (names or routes) and callable(target):
+        target = target()
+    if not (names or routes) and target:
+        tref = values(target.get('ref'))[:1]
+        if target.get('freeway') and tref:
+            routes = [' '.join([tref[0], target.get('cardinal', '')]).strip()]
+        elif target.get('name'):
+            names = values(target['name'])[:1]
+        elif tref:
+            routes = tref
+        source = 'target' if names or routes else ''
+    if not (ref or names or routes):
+        return None
+    out = dict(ref=ref, names=names[:3], routes=routes[:3])
+    if source == 'target':
+        out['source'] = source
+    symbols = values(get('destination:symbol'))
+    if symbols:
+        out['symbols'] = symbols[:3]
+    return out
+
+
+def _heading_cardinal(d, ref=''):
+    """The posted direction of a route travelled along d (east, north): an Interstate's or US route's even
+    number runs east-west and its odd number north-south (the numbering rule), any other road its dominant
+    axis."""
+    m = re.match(r'\s*(?:I|US)[\s-]*(\d{1,3})(?!\d)', str(ref))
+    if m:
+        ew = int(m.group(1)) % 2 == 0
+    else:
+        ew = abs(float(d[0])) >= abs(float(d[1]))
+    if ew:
+        return 'EAST' if d[0] >= 0 else 'WEST'
+    return 'NORTH' if d[1] >= 0 else 'SOUTH'
 
 
 def _direction(tags):
@@ -80,11 +119,12 @@ def _direction(tags):
     return 1 if value in ('yes', '1', 'true') or tags.get('highway') in ('motorway', 'motorway_link') else 0
 
 
-def index_records(main_ways, links, coords, node_tags):
+def index_records(main_ways, links, coords, node_tags, other_roads=None):
     """Join shared OSM nodes, excluding entries and private median/service connections.
 
     Coordinates are lon/lat. Only motorway/trunk vertices are retained by the
-    caller, not the regional PBF's complete node population. Paths stop at an
+    caller, not the regional PBF's complete node population. other_roads: {node id: tags} of non-freeway
+    roads at link ends (optional): a link with no destination tags is then signed with the road it reaches. Paths stop at an
     ambiguous upstream fork instead of jumping onto another carriageway.
     """
     incoming = defaultdict(list)
@@ -99,6 +139,44 @@ def index_records(main_ways, links, coords, node_tags):
         p, q = np.asarray(coords[a]), np.asarray(coords[b])
         return (q-p)*[111320.*math.cos(math.radians(float((p[1]+q[1])/2))), 111320.]
     def unit(d): return d/max(float(np.linalg.norm(d)), 1e-9)
+    outgoing = defaultdict(list)
+    for wid, refs, tags in main_ways:
+        directions = (1, -1) if _direction(tags) == 0 else (_direction(tags),)
+        for direction in directions:
+            path = refs if direction == 1 else refs[::-1]
+            for a, b in zip(path[:-1], path[1:]):
+                if a in coords and b in coords and a != b:
+                    outgoing[a].append((b, wid, tags))
+    link_from = defaultdict(list)
+    for rid, source, tags in links:
+        if len(source) >= 2:
+            ordered = source[::-1] if _direction(tags) == -1 else source
+            link_from[ordered[0]].append((rid, ordered, tags))
+    others = other_roads or {}
+
+    def target_of(refs):
+        """The road a link leads to: follow single link continuations to a mainline node (a freeway: its
+        ref and the direction travelled on it) or to a node of another mapped road (its name or ref)."""
+        seen, at = set(), refs
+        for _ in range(12):
+            end = at[-1]
+            if end in outgoing and end != refs[0]:
+                b, wid, tags = outgoing[end][0]
+                ref = str(tags.get('ref', '')).split(';')[0].strip()
+                posted = tags.get('destination:direction') or tags.get('direction') or ''
+                import throughsigns
+                card = throughsigns.cardinal(posted) or (_heading_cardinal(delta(end, b), ref) if ref else '')
+                return dict(ref=ref, name=tags.get('name', ''), cardinal=card,
+                            freeway=tags.get('highway') in MAIN_CLASSES)
+            if end in others:
+                t = others[end]
+                return dict(ref=t.get('ref', ''), name=t.get('name', ''), freeway=False)
+            nxt = [r for r in link_from.get(end, ()) if r[0] not in seen]
+            if len(nxt) != 1:
+                return None
+            seen.add(nxt[0][0])
+            at = nxt[0][1]
+        return None
     out = []
     for rid, source, tags in links:
         if len(source) < 2 or tags.get('access') in ('private', 'no') or tags.get('service') == 'emergency_access':
@@ -108,7 +186,7 @@ def index_records(main_ways, links, coords, node_tags):
         nid = refs[0]
         if nid not in incoming or nid not in coords:
             continue                       # the other end is an on-ramp, not an exit
-        label = labels(node_tags.get(nid, {}), tags, backwards)
+        label = labels(node_tags.get(nid, {}), tags, backwards, lambda: target_of(refs))
         if label is None:
             continue
         ramp = [n for n in refs if n in coords]
@@ -563,20 +641,30 @@ def consolidate(roadside, overheads, mph=True, obstacles=()):
                 break
         if host is None:
             sign = dict(sign)
-            sign['rows'] = [(_exit_key(label), _row_ref(label), metres)]
+            sign['rows'] = [(_exit_key(label), _row_ref(label), metres, label, _row_side(sign))]
             kept.append(sign)
             continue
         k, along = host
         if any(r[0] == _exit_key(label) for r in k['rows']):
             continue                            # (the same exit again: a duplicate record)
         if len(k['rows']) < MAX_ROWS:
-            k['rows'].append((_exit_key(label), _row_ref(label), max(metres+along, 1.)))
+            k['rows'].append((_exit_key(label), _row_ref(label), max(metres+along, 1.), label, _row_side(sign)))
     out_roadside, out_overheads = list(fixed), list(other_overheads)
     for sign in kept:
         rows = sorted(sign.pop('rows'), key=lambda r: r[2])
         if len(rows) > 1:
-            listed = [dict(ref=ref, distance=rounded_distance(m, mph)) for _, ref, m in rows]
+            listed = [dict(ref=ref, dest=row_destination(lab), distance=rounded_distance(m, mph),
+                           label=lab, side=side) for _, ref, m, lab, side in rows]
+            listed = fit_rows(listed)
+            # A split at one point (I-84 west: I-5 South / I-5 North at the same gore) or a list too wide
+            # for one panel: highwaysigns makes it one panel per exit side by side on a gantry
+            # (throughsigns.refit), the list staying only where that does not fit.
+            if len({r['distance'] for r in listed}) == 1:
+                sign['split'] = True
+            if list_dimensions(listed)[0] > LIST_MAX_W or any(r.get('trimmed') for r in listed):
+                sign['wide'] = True
             if sign['kind'] == 'through':
+                sign['base_panels'] = [dict(p) for p in sign['panels']]
                 sign['panels'] = [dict(p) for p in sign['panels']]
                 for p in sign['panels']:
                     if p['exit']:
@@ -611,24 +699,65 @@ def _respace_panels(sign):
 
 
 LIST_CAP, LIST_PITCH = .52, .82
+LIST_GAP = .6                    # between a row's exit number, destination and distance
+LIST_MAX_W = 9.1                 # 30 ft: wider than this, one panel per exit side by side (MUTCD 2E.14)
+
+
+def _row_side(sign):
+    return 1 if sign.get('side', 1) > 0 else -1
+
+
+def row_destination(label):
+    """A combined panel row's destination: the posted names (a dash between two; the glyph set has no en
+    dash), else the posted or derived route ("I-5 South"), else nothing."""
+    names = list(label.get('names') or ())
+    if names:
+        return ' - '.join(names[:2])
+    return ' '.join(label.get('routes') or ())
+
+
+def fit_rows(rows):
+    """Keep a combined panel within LIST_MAX_W: first destinations only, then none (rows marked trimmed)."""
+    rows = [dict(r) for r in rows]
+    if list_dimensions(rows)[0] <= LIST_MAX_W:
+        return rows
+    for r in rows:
+        names = list(r['label'].get('names') or ())
+        if len(names) > 1:
+            r['dest'], r['trimmed'] = names[0], True
+    if list_dimensions(rows)[0] <= LIST_MAX_W:
+        return rows
+    for r in rows:
+        if r.get('dest'):
+            r['dest'], r['trimmed'] = '', True
+    return rows
+
+
+def _columns(rows):
+    ref = max(guide_width(r['ref'], LIST_CAP) for r in rows)
+    dest = max([guide_width(r['dest'], LIST_CAP) for r in rows if r.get('dest')] + [0.])
+    dist = max(guide_width(r['distance'], LIST_CAP) for r in rows)
+    return ref, dest, dist
 
 
 def list_dimensions(rows):
-    """A combined advance panel: one row per exit, the exit number left and its distance right."""
-    ref = max(guide_width(r['ref'], LIST_CAP) for r in rows)
-    dist = max(guide_width(r['distance'], LIST_CAP) for r in rows)
-    return ref+dist+1.0+.76, .5+LIST_CAP+(len(rows)-1)*LIST_PITCH+.5
+    """A combined advance panel: one row per exit, its exit number, its destination, then its distance."""
+    ref, dest, dist = _columns(rows)
+    return ref+(dest+LIST_GAP if dest else 0.)+dist+1.0+.76, .5+LIST_CAP+(len(rows)-1)*LIST_PITCH+.5
 
 
 def list_layout(rows, width, height):
     """Text rows of a combined panel (Mesh.panel and the overhead's exit panel)."""
     top = height-.5
-    ref = max(guide_width(r['ref'], LIST_CAP) for r in rows)
-    dist = max(guide_width(r['distance'], LIST_CAP) for r in rows)
+    ref, dest, dist = _columns(rows)
+    left = -width/2+.38
     out = []
     for i, r in enumerate(rows):
         baseline = top-LIST_CAP-i*LIST_PITCH
-        out.append(dict(value=r['ref'], y=-width/2+.38+ref/2, baseline=baseline, height=LIST_CAP, max_width=ref+.01))
+        out.append(dict(value=r['ref'], y=left+ref/2, baseline=baseline, height=LIST_CAP, max_width=ref+.01))
+        if r.get('dest'):
+            out.append(dict(value=r['dest'], y=left+ref+.5+LIST_GAP/2+dest/2, baseline=baseline, height=LIST_CAP,
+                            max_width=dest+.01))
         out.append(dict(value=r['distance'], y=width/2-.38-dist/2, baseline=baseline, height=LIST_CAP,
                         max_width=dist+.01))
     return out

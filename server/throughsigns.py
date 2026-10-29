@@ -11,6 +11,8 @@ import math
 
 import numpy as np
 
+import gantryclear
+
 import exitsigns as signs
 
 WAY_KEYS = tuple(dict.fromkeys(signs.WAY_KEYS + (
@@ -205,8 +207,51 @@ def dimensions(content):
     return min(10., max(5.8, longest+.9, header+.8)), 3.7+max(0, len(content['names'])-1)*.88
 
 
+SLIDES_M = (0., -30., 30., -60., 60., -90., 90., -120., 120., -150., 150.)
+SIGHT_M = 100.                  # a moved gantry keeps this much road before it free of crossing decks
+PANEL_GAP = .25
+
+
+def lay_out(panels):
+    """Side-by-side panels left to right in the given order, centred on the road point."""
+    total = sum(p['width'] for p in panels)+PANEL_GAP*(len(panels)-1)
+    cursor = -total/2.
+    for p in panels:
+        p['offset'] = cursor+p['width']/2.
+        cursor += p['width']+PANEL_GAP
+    h = max(p['height'] for p in panels)
+    for p in panels:
+        p['height'] = h
+    return panels
+
+
 def _assembly(frame, obj, pavements, q, direction, box, elev, chunks, content,
-              exit_label=None, side=1, distance='', allow_outside=False):
+              exit_label=None, side=1, distance='', allow_outside=False, panels=None):
+    """The gantry nearest station q that clears every other road (gantryclear): slid along its own road by
+    up to 150 m (MUTCD 2E: an advance sign's distance is a rounded one) where it would meet a deck, never
+    moved behind an overpass that hides it. None when no station fits (then a roadside sign or nothing)."""
+    q, direction = np.asarray(q, float), np.asarray(direction, float)
+    for shift in SLIDES_M:
+        found = _assembly_at(frame, obj, pavements, q+direction*shift, direction, box, elev, chunks, content,
+                             exit_label, side, distance, allow_outside if shift == 0. else True, panels)
+        if found is None:
+            if shift == 0. and not allow_outside:
+                x0, y0, x1, y1 = box
+                if not (x0 <= q[0] < x1 and y0 <= q[1] < y1):
+                    return None          # (another tile owns this station)
+            continue
+        if gantryclear.clashes(found, chunks):
+            continue
+        if shift and gantryclear.sight_blocked(found, chunks, SIGHT_M):
+            continue
+        if shift:
+            found['slid_m'] = shift
+        return found
+    return None
+
+
+def _assembly_at(frame, obj, pavements, q, direction, box, elev, chunks, content,
+                 exit_label=None, side=1, distance='', allow_outside=False, panels=None):
     import signroads
     extra = obj.get('through', obj.get('exit'))
     found = _candidate(pavements, q, direction, extra['main_ids'])
@@ -225,13 +270,16 @@ def _assembly(frame, obj, pavements, q, direction, box, elev, chunks, content,
     lat, lon, _ = frame.enu_to_geodetic(float(at_xy[0]), float(at_xy[1]), 0.)
     import signstates
     state = str(signstates.states(lat, lon).item())
-    if content:
+    given = panels is not None
+    if given:
+        panels = lay_out([dict(p) for p in panels])
+    elif content:
         w, h = dimensions(content)
         panels = [dict(label=content, width=w, height=h, offset=0., exit=False)]
     else:                                   # (an exit panel alone: no room for a ground mount)
         w, h = signs.dimensions(exit_label, 'advance', state)
         panels = [dict(label=exit_label, width=w, height=h, offset=0., exit=True)]
-    if exit_label and content:
+    if not given and exit_label and content:
         ew, eh = signs.dimensions(exit_label, 'advance', state)
         panels[0]['offset'] = -side*(ew+.25)/2.
         panels.append(dict(label=exit_label, width=ew, height=eh,
@@ -261,6 +309,34 @@ def _assembly(frame, obj, pavements, q, direction, box, elev, chunks, content,
                 travel=travel.tolist(), panels=panels, bottom=bottom, bases=bases,
                 poles=[v[0] for v in poles], side=side, distance=distance,
                 state=state)
+
+
+def exit_panels(rows, state):
+    """One full exit panel per combined row (its shields, destinations, own distance and exit tab), the
+    left-hand exits first: the side-by-side style of a split or of a list too wide for one panel."""
+    out = []
+    for r in rows:
+        w, h = signs.dimensions(r['label'], 'advance', state)
+        out.append(dict(label=r['label'], width=w, height=h, exit=True, distance=r['distance'],
+                        side=r.get('side', 1)))
+    left = [p for p in out if p['side'] < 0]
+    return left[::-1]+[p for p in out if p['side'] >= 0]
+
+
+def refit(frame, obj, pavements, sign, elev, chunks, panels):
+    """sign's gantry re-planned at its station with these panels (wider, or more of them): its columns and
+    clearances found again (_assembly, sliding if it must); None when it does not fit."""
+    extra = obj.get('exit', obj.get('through'))
+    approach = signs._xy(frame, extra['approach'])
+    near = signs._nearest(np.asarray(sign['centre'][:2], float), [('', None, approach, 0.)])
+    if near is None:
+        return None
+    side = int(extra.get('side', sign.get('side', 1)))
+    found = _assembly(frame, obj, pavements, near[6], np.asarray(sign['travel'], float), (0., 0., 0., 0.),
+                      elev, chunks, None, extra.get('label'), side, sign.get('distance', ''), True, panels)
+    if found:
+        found['advance_m'] = sign.get('advance_m', 0.)
+    return found
 
 
 def exit_gantry(frame, obj, pavements, sign, elev, chunks=()):
@@ -376,13 +452,14 @@ class Mesh(signs.Mesh):
             elif panel['exit']:
                 # Reuse the established exit panel and tab layout without its posts.
                 self.rounded_panel(w,bottom,h,0)
+                pside = panel.get('side', sign['side'])
                 if content['ref']:
                     tw = min(w, max(2.2, signs.guide_width('EXIT '+content['ref'], .36)+.5))
-                    ty = sign['side']*(w-tw)/2
+                    ty = (1 if pside > 0 else -1)*(w-tw)/2
                     self.rounded_panel(tw,bottom+h,.66,0,ty)
                     self.guide_text('EXIT '+content['ref'],ty,bottom+h+.16,.36,tw-.3)
                 layout = signs.advance_layout(dict(label=content, width=w, height=h,
-                    side=sign['side'], kind='advance', distance=sign['distance'], state=sign['state']))
+                    side=pside, kind='advance', distance=panel.get('distance', sign['distance']), state=sign['state']))
                 for row in layout['lines']:
                     self.guide_text(row['value'],row['y'],bottom+row['baseline'],row['height'],row['max_width'])
                 for row in layout.get('directions', ()):

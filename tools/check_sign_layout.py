@@ -9,7 +9,11 @@ flat ground), then checks each sign:
   * spacing:  no two guide signs on the same roadway and direction closer than exitsigns.MIN_SPACING_M
     (MUTCD 2E.39 / 2E.11: advance guide signs on urban freeways at least 800 ft apart where possible,
     never closer than the driver can read; 150 m is our hard floor);
-  * size:     panel width/height follow from the legend (lines, text width, shields, rows), so not all equal.
+  * size:     panel width/height follow from the legend (lines, text width, shields, rows), so not all equal;
+  * clearance: every overhead structure against every other road (server/gantryclear.py, loaded from this
+    checkout even with --server, so a before state is measured by the same rule): no deck through its box
+    unless 5.3 m under it or over its truss (decks of unknown height count as one level up), columns off
+    every pavement and deck.
 --server points at another checkout's server/ to measure the before state.
 """
 import argparse
@@ -25,6 +29,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Portland: I-405 at W Burnside to the Fremont bridge, I-5/I-84 by OMSI and the Banfield.
 PORTLAND = (45.505, -122.692, 45.535, -122.655)
 MIN_SPACING_M = 150.
+
+
+def gantryclear():
+    import importlib.util
+    path = os.path.join(HERE, '..', 'server', 'gantryclear.py')
+    spec = importlib.util.spec_from_file_location('gantryclear_check', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def load(server):
@@ -75,6 +88,10 @@ def plan(m, box):
                 hs.build_tile(md, frame, tx, ty, elev, chunks, False, True, None, None)
     finally:
         ts.build = real_build
+    box_decks = []
+    for tx in range(int(math.floor(e0/T)), int(math.floor(e1/T))+1):
+        for ty in range(int(math.floor(n0/T)), int(math.floor(n1/T))+1):
+            box_decks.extend(decks_for(m, context, frame, tx, ty))
     signs = []
     for exits, overheads in captured:
         signs.extend(exits)
@@ -85,7 +102,7 @@ def plan(m, box):
     pts = np.array([(lo, la) for lo in lons for la in lats])
     pav = context.pavements(frame, pts, False)
     outlines = m['exitsigns']._outlines(pav)
-    return frame, signs, pav, outlines
+    return frame, signs, pav, outlines, box_decks
 
 
 def _inside(p, poly):
@@ -125,7 +142,7 @@ def legend_rows(sign):
 
 def legend_width(es, label, rows=None, state=''):
     if rows:
-        return max(es.guide_width(r['ref'], .52) for r in rows)+max(es.guide_width(r['distance'], .52) for r in rows)
+        return es.list_dimensions(rows)[0]-1.76          # (the text columns; the margins are 1.76 m)
     routes = es.route_symbols(label['routes'], state)
     names = label['names'] or ([] if routes else ['EXIT '+label['ref']])
     return max([es.guide_width(n, .58) for n in names]+[.86*bool(routes)]+[0.])
@@ -178,6 +195,33 @@ def check(signs, outlines):
     return signs, road_hits, spacing, sizes
 
 
+def overhead_clashes(gc, signs, decks, outlines):
+    """Overhead structures that meet another road: a deck through their box, or a column on pavement/deck."""
+    out = []
+    for s in signs:
+        if s['kind'] != 'through':
+            continue
+        c = np.asarray(s['centre'][:2], float)
+        t = np.asarray(s['travel'], float)
+        right = np.array([t[1], -t[0]])
+        reasons = [r[0] for r in gc.clashes(s, decks)]
+        for p in s['poles']:
+            point = c+right*p
+            if _hits([point], outlines):
+                reasons.append('column on road')
+            for d in decks:
+                line = np.asarray(d['n'], float)[:, :2]
+                ab = np.diff(line, axis=0)
+                l2 = np.maximum((ab*ab).sum(1), 1e-12)
+                u = np.clip(((point-line[:-1])*ab).sum(1)/l2, 0., 1.)
+                if np.min(np.linalg.norm(line[:-1]+u[:, None]*ab-point, axis=1)) < d['w']/2:
+                    reasons.append('column on deck')
+                    break
+        if reasons:
+            out.append((s, sorted(set(reasons))))
+    return out
+
+
 def describe(s):
     lab = s.get('label') or next((p['label'] for p in s.get('panels', ()) if p.get('exit')), {})
     ref = lab.get('ref', '') if isinstance(lab, dict) else ''
@@ -227,17 +271,25 @@ def main():
     args = ap.parse_args()
     m = load(os.path.abspath(args.server))
     box = tuple(map(float, args.box.split(',')))
-    frame, signs, pav, outlines = plan(m, box)
+    frame, signs, pav, outlines, decks = plan(m, box)
     signs, road_hits, spacing, sizes = check(signs, outlines)
     misfit = misfits(m['exitsigns'], signs)
+    clash = overhead_clashes(gantryclear(), signs, decks, outlines)
     kinds = {}
     for s in signs:
         kinds[s['kind']] = kinds.get(s['kind'], 0)+1
     combined = sum(1 for s in signs if s.get('rows') or any(p.get('rows') for p in s.get('panels', ())))
-    report = dict(signs=len(signs), kinds=kinds, combined=combined, in_road=len(road_hits),
+    side_by_side = sum(1 for s in signs if s['kind'] == 'through' and sum(1 for p in s['panels'] if p['exit']) > 1)
+    with_dest = sum(1 for s in signs for p in s.get('panels', ()) for r in (p.get('rows') or ()) if r.get('dest')) +         sum(1 for s in signs for r in (s.get('rows') or ()) if r.get('dest'))
+    rows_total = sum(len(p.get('rows') or ()) for s in signs for p in s.get('panels', ())) +         sum(len(s.get('rows') or ()) for s in signs)
+    report = dict(signs=len(signs), kinds=kinds, combined=combined, side_by_side_gantries=side_by_side,
+                  list_rows=rows_total, list_rows_with_destination=with_dest,
+                  gantries=sum(1 for s in signs if s['kind'] == 'through'),
+                  gantries_clashing=len(clash), in_road=len(road_hits),
                   too_close_pairs=len(spacing), distinct_sizes=len(sizes), size_misfits=len(misfit),
                   misfit_list=[f'{describe(a)} legend {n:.1f} m panel {w:.1f} m' for a, n, w in misfit],
                   in_road_list=[describe(s) for s in road_hits],
+                  clash_list=[f'{describe(s)} {",".join(r)}' for s, r in clash],
                   too_close_list=[f'{describe(a)} | {describe(b)} {dist:.0f} m' for a, b, dist in spacing])
     print(json.dumps(report, indent=1))
     if args.json:
@@ -248,7 +300,7 @@ def main():
         e0, n0, _ = frame.geodetic_to_enu(lat0, lon0, 0.)
         e1, n1, _ = frame.geodetic_to_enu(lat1, lon1, 0.)
         render(args.png, frame, signs, pav, road_hits, spacing, ((e0, n0), (e1, n1)), args.scale)
-    return 1 if road_hits or spacing or misfit else 0
+    return 1 if road_hits or spacing or misfit or clash else 0
 
 
 if __name__ == '__main__':

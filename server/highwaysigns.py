@@ -72,8 +72,10 @@ def plan_tile(source, frame, tx, ty, elev, chunks=(), left_hand=False, mph=True,
     context = source.context(urban, widths)
     everywhere = (-float('inf'), -float('inf'), float('inf'), float('inf'))
     roadside_all, overhead_all, miles = [], [], []
+    hosts = {}
     for obj in sorted({o['id']: o for o in objects if o.get('exit')}.values(), key=lambda o: str(o['id'])):
         pavements, mains = exitsigns.source_pavements(frame, obj, context, left_hand)
+        hosts[obj['id']] = (obj, pavements)
         roadside = exitsigns.place(frame, [obj], (), everywhere, elev, chunks, left_hand, mph,
                                    pavements=pavements, ramp_mains=mains)
         distance = '1/2 MILE' if mph else '500 m'
@@ -93,6 +95,7 @@ def plan_tile(source, frame, tx, ty, elev, chunks=(), left_hand=False, mph=True,
         pavements = throughsigns.source_pavements(frame, obj, context, left_hand)
         through_all.extend(throughsigns.place(frame, [obj], pavements, box, elev, chunks, mph, allow_outside=True))
     roadside_all, overhead_all = exitsigns.consolidate(roadside_all, overhead_all, mph, through_all)
+    roadside_all, overhead_all = arrange(frame, hosts, roadside_all, overhead_all, elev, chunks)
 
     def inside(s):
         return box[0] <= s['centre'][0] < box[2] and box[1] <= s['centre'][1] < box[3]
@@ -103,6 +106,47 @@ def plan_tile(source, frame, tx, ty, elev, chunks=(), left_hand=False, mph=True,
         pavements = milemarkers.source_pavements(frame, obj, context, left_hand)
         miles.extend(milemarkers.place(frame, [obj], pavements, box, elev, chunks))
     return exits, overheads, miles
+
+
+def arrange(frame, hosts, roadside, overheads, elev, chunks=()):
+    """Combined panels after exitsigns.consolidate, as signed in practice: a split at one point, or a list too
+    wide for one panel, becomes one exit panel per branch side by side on one gantry; a gantry whose list
+    panel grew is re-planned so its columns and clearances still hold (throughsigns.refit). Where no gantry
+    fits, a roadside list stays a list and a gantry falls back to its own panels."""
+    out_roadside, out_overheads = [], []
+    for sign in roadside+overheads:
+        through = sign['kind'] == 'through'
+        rows = sign.get('rows') or next((p.get('rows') for p in sign.get('panels', ()) if p.get('rows')), None)
+        host = hosts.get(sign['id'])
+        if not rows or host is None:
+            (out_overheads if through else out_roadside).append(sign)
+            continue
+        obj, pavements = host
+        base = [p for p in sign.get('base_panels', sign.get('panels', ())) if not p['exit']]
+        tries = []
+        if sign.get('split') or sign.get('wide'):
+            exits = throughsigns.exit_panels(rows, sign.get('state', ''))
+            side = 1 if sign.get('side', 1) > 0 else -1
+            tries.append(base+exits if side > 0 else exits+base)
+        if through:
+            tries.append(sorted(sign['panels'], key=lambda p: p['offset']))
+        placed = None
+        for panels in tries:
+            placed = throughsigns.refit(frame, obj, pavements, sign, elev, chunks, panels)
+            if placed:
+                break
+        if placed:
+            placed['distance'] = sign.get('distance') or rows[0]['distance']
+            if sum(1 for p in placed['panels'] if p['exit']) > 1:
+                placed['split_panels'] = True
+            out_overheads.append(placed)
+        elif through:
+            fallback = {k: v for k, v in sign.items() if k not in ('base_panels', 'split', 'wide')}
+            fallback['panels'] = sign['base_panels']
+            out_overheads.append(fallback)
+        else:
+            out_roadside.append(sign)
+    return out_roadside, out_overheads
 
 
 def build_tile(md, frame, tx, ty, elev, chunks=(), left_hand=False, mph=True, urban=None, widths=None):
