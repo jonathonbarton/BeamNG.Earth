@@ -569,8 +569,13 @@ def consolidate(roadside, overheads, mph=True, obstacles=()):
         k, along = host
         if any(r[0] == _exit_key(label) for r in k['rows']):
             continue                            # (the same exit again: a duplicate record)
+        metres = max(metres+along, 1.)
+        if any(rounded_distance(r[2], mph) == rounded_distance(metres, mph) for r in k['rows']):
+            continue                            # (a split at the same point, e.g. I-5 north/south: a list
+            #  "Salem 1/4 MILE / Seattle 1/4 MILE" tells nothing; the host keeps its full legend and the
+            #  other exit its own decision sign)
         if len(k['rows']) < MAX_ROWS:
-            k['rows'].append((_exit_key(label), _row_ref(label), max(metres+along, 1.)))
+            k['rows'].append((_exit_key(label), _row_ref(label), metres))
     out_roadside, out_overheads = list(fixed), list(other_overheads)
     for sign in kept:
         rows = sorted(sign.pop('rows'), key=lambda r: r[2])
