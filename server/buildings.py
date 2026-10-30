@@ -2283,6 +2283,9 @@ def _hulls_nearby(frame, layers, x0, y0, x1, y1, water_xy, reach=ships.PIER_REAC
         for i in rows:
             if "src_dataset" in a and str(a["src_dataset"][i]) != "OpenStreetMap":
                 continue
+            if not water_xy and not ships.has_evidence({k: (a[k][i] if k in a else None)
+                                                        for k in ("class", "subtype", "name")}):
+                continue                        # (no water near and no ship's tags: cheaper than the outline)
             parts = f.parts(i)
             if not parts or not parts[0] or len(parts[0][0]) < 4:
                 continue
@@ -2291,7 +2294,7 @@ def _hulls_nearby(frame, layers, x0, y0, x1, y1, water_xy, reach=ships.PIER_REAC
             if (x0 <= cx < x1 and y0 <= cy < y1) or max(np.ptp(e), np.ptp(n)) < ships.MIN_L / math.sqrt(2):
                 continue                        # (the tile's own: tested already)
             r = clean_ring(np.stack([e - x0, n - y0], 1))
-            at = {k: (a[k][i] if k in a else None) for k in ("class", "name")}
+            at = {k: (a[k][i] if k in a else None) for k in ("class", "subtype", "name")}
             if r is not None and ships.is_ship(r, at, lambda: ships.on_water(r.mean(0), water_xy)):
                 out.append(r)
     return out
@@ -2354,7 +2357,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                 if h_ < min_size[0] and abs(float(np.dot(e[:-1], n[1:]) - np.dot(e[1:], n[:-1]))) / 2 < min_size[1]:
                     continue
             at = {k: (a[k][i] if k in a else None) for k in
-                  ("class", "height", "num_floors", "min_height", "roof_shape", "roof_height", "name",
+                  ("class", "subtype", "height", "num_floors", "min_height", "roof_shape", "roof_height", "name",
                    "facade_material", "facade_color", "roof_material", "roof_color")}
             if key is not None:         # (plan's random choices keyed on the feature, not where the anchor puts it)
                 at["seed_id"] = str(key)
@@ -2368,7 +2371,11 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                 # a ship mapped with parts (the Iowa's turrets, the Queen Mary's funnels): the hull, its parts on deck
                 ring_ = clean_ring(np.stack([e - x0, n - y0], 1))
                 if ring_ is not None and ships.is_ship(ring_, at, lambda: ships.on_water(ring_.mean(0), water_xy)):
-                    ship_parts = [(p[0] - np.array([x0, y0]), None if p[1] is None else p[1][0]) for p in bparts]
+                    ship_parts = []     # (its ring, (own height, bottom) or None)
+                    for p in bparts:
+                        pr_ = clean_ring(p[0] - np.array([x0, y0]))
+                        if pr_ is not None:
+                            ship_parts.append((pr_, p[1]))
                     bparts = None
             if bparts and any(p[1] is not None for p in bparts):
                 # drawn as its parts, with the building's class and one look for all of them; a part
@@ -2459,6 +2466,20 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
         for k_ in piers:
             if any(ships.pier_alongside(rings[k_], hr) for hr in hulls):
                 attrs[k_] = dict(attrs[k_], pier=True)
+    # what lies mostly on a ship's hull is the ship's (a second outline of it, machine-learned or a second OSM way): not
+    # a building as well. Its hull may be the next tile's (those tagged a ship: asking the water for every tile by the
+    # water cost a waterfront tile ~10 %)
+    if any(not at.get("ship") and not at.get("pier") for at in attrs):
+        hulls = [r for r, at in zip(rings, attrs) if at.get("ship")] + _hulls_nearby(frame, layers, x0, y0, x1, y1, None)
+        if hulls:
+            drop = {k_ for k_, (r, at) in enumerate(zip(rings, attrs)) if not at.get("ship") and not at.get("pier")
+                    and any(ships.on_hull(r, hr) for hr in hulls)}
+            if drop:
+                keep = [k_ for k_ in range(len(rings)) if k_ not in drop]
+                rings, attrs = [rings[k_] for k_ in keep], [attrs[k_] for k_ in keep]
+                looks, mins = [looks[k_] for k_ in keep], [mins[k_] for k_ in keep]
+                if not rings:
+                    return []
     if bridges_xy or decks:             # a road bridge through a building: a passage (Tower Bridge's towers and gate)
         def ground_at(c):
             la, lo, _ = frame.enu_to_geodetic(float(c[0]) + x0, float(c[1]) + y0, 0.0)

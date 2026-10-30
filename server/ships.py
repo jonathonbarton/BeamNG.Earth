@@ -5,14 +5,17 @@ OSM maps museum ships as buildings (building=ship, historic=ship); Overture keep
 
 Detection (is_ship) is from the outline and the tags only: an OSM footprint (never a machine-learned one) 25 m+ long,
 3-10x as long as wide, filling half to 0.92 of its oriented box, with one end pointed or rounded, and either a ship's
-class ("ship"), a ship's word in its name (USS, SS, battleship ...) or its centre on mapped water. The water test is
-asked last and only for an outline that passed every shape test (a handful per city), so tiles do not get slower.
+class ("ship"), a ship's word in its name (USS, SS, battleship ...), an attraction's subtype with no building class, or
+its centre on mapped water. Overture drops OSM's building=ship, historic=ship and ship:type: what is left of them is
+subtype "entertainment" with no class, in any language (Mikasa, on land, named in Japanese; Cutty Sark, in a dry dock).
+The water test is asked last and only for an outline that passed every shape test (a handful per city), so tiles do
+not get slower. A pointed outline on land with none of these stays a building.
 
 Drawing (draw): a hull lofted from STATIONS cross-sections of the footprint's own plan (its width at each station;
 the bow is the narrower end): the deck rises toward the bow (sheer), the hull narrows to the waterline and keel, the
 stem is raked back and the stern cut up. On it a class profile (PROFILES, keyed on the ship class or type): turrets,
 superstructure, funnels, masts, a carrier's island; else a generic warship or liner. Mapped building:part outlines on
-an unknown ship stand where they are mapped.
+an unknown ship stand where they are mapped, each at its own mapped height (HMS Belfast: 33 parts down to its guns).
 
 Profiles are measured along the ship from the bow (x 0) to the stern (x 1); heights are metres over the waterline for
 a ship of length L (scaled to the footprint's length); widths are shares of the beam. Every number is worked out from
@@ -34,7 +37,14 @@ SLENDER = (3.0, 10.0)       # ... this many times as long as wide (real hulls 5-
 FILL = (0.5, 0.92)          # ... filling this share of its oriented box (pointed or rounded ends)
 END_SHARE = 0.65            # ... one end at most this share of the beam wide over its last END_L of length
 END_L = 0.06
+BOTH_ENDS_SHARE = 0.7       # ... or, tagged a ship, both ends this share (SS Great Britain: 0.65 and 0.69, a ship's bluff
+                            # bow and round stern)
 CLASSES = ("", "yes", "ship", "museum")     # building classes a ship may carry (Overture: none, mostly)
+ATTRACTION = "entertainment"    # Overture's subtype of a museum or attraction (what it keeps of a ship's OSM tags) ...
+ATTRACTION_SLENDER = 4.5        # ... only this slender: real ones 5.2-8.4; Bristol's Folk House, an arts centre, 3.2
+ATTRACTION_OFF = (0.10, 0.25)   # ... and this straight: its middle line off the long axis, mean and most, of the half beam
+                                # (real ones on land at most 0.09, 0.22; a museum wing 0.12-0.44, 0.23-0.91 in 7.4 M footprints)
+MUSEUM = re.compile(r"\bmuseum\b(?! ?ship)")     # a building about a ship, beside it ("SS Great Britain Museum")
 NAME = re.compile(r"\b(uss|ss|hms|rms|mv|ms|uscgc|battleship|ship|schooner|steamer|steamship|lightship|submarine|"
                   r"frigate|destroyer|cruiser|aircraft carrier|liner|ferry)\b")
 NAVY = re.compile(r"\b(uss|hms|uscgc|battleship|submarine|frigate|destroyer|cruiser|carrier)\b")
@@ -42,6 +52,8 @@ FREEBOARD = (3.0, 12.0)     # m: an unknown ship's deck over the water (0.6 of t
 SHEER = (1.35, 1.1)         # an unknown ship's deck at the bow and the stern, of its freeboard amidships
 TIER_M = 3.2                # m per deck of an unknown ship's mapped superstructure
 PART_BIG_M = 10.0           # m: a mapped part this long (half) is superstructure; smaller ones turrets
+PART_LITE_M = 3.0           # m: the far (lite) mesh leaves out mapped parts shorter than this (guns, rails)
+ON_HULL_SHARE = 0.5         # a footprint this much on a ship's hull is the ship's (on_hull)
 TURRET_M = 3.5
 TOP_SHARE = 0.15            # a ship over 60 m: its mast tops this share of its length over the water
 STATIONS, STATIONS_LITE = 48, 16
@@ -163,11 +175,46 @@ def is_ship(ring, attrs, water=False):
         return False
     if not FILL[0] <= (B._area2(ring) / 2) / max(4 * hl * hw, 1e-6) <= FILL[1]:
         return False
-    if min(end_widths(ring, c, u, hl)) > END_SHARE * 2 * hw:
+    ends = end_widths(ring, c, u, hl)
+    tagged = has_evidence(attrs)
+    if min(ends) > END_SHARE * 2 * hw and not (tagged and max(ends) <= BOTH_ENDS_SHARE * 2 * hw):
         return False
-    if cls == "ship" or NAME.search(str(attrs.get("name") or "").lower()):
+    if tagged and (_named(attrs) or (hl >= ATTRACTION_SLENDER * hw and _straight(ring, c, u, hl, hw))):
         return True
     return bool(water() if callable(water) else water)
+
+
+def _straight(ring, c, u, hl, hw):
+    """Whether an outline's middle line keeps to its long axis, as a hull's does (a wing or an L does not)."""
+    off = np.abs(_widths(ring, c, u, hl, np.linspace(0.1, 0.9, 17))[:, 0]) / max(hw, 1e-6)
+    return float(off.mean()) <= ATTRACTION_OFF[0] and float(off.max()) <= ATTRACTION_OFF[1]
+
+
+def has_evidence(attrs):
+    """Whether a footprint's tags say ship (its outline and its water aside)."""
+    if MUSEUM.search(str(attrs.get("name") or "").lower()) and str(attrs.get("class") or "").lower() != "ship":
+        return False
+    cls = str(attrs.get("class") or "").lower()
+    return _named(attrs) or cls == "museum" or (not cls and str(attrs.get("subtype") or "") == ATTRACTION)
+
+
+def _named(attrs):
+    """Its class or name says ship (not merely an attraction's subtype)."""
+    return str(attrs.get("class") or "").lower() == "ship" or bool(NAME.search(str(attrs.get("name") or "").lower()))
+
+
+def on_hull(ring, hull):
+    """Whether a footprint lies mostly on a ship's hull (local rings): a second outline of the ship (machine-learned, a
+    second OSM way) or something standing on it, never a building as well. A canopy the ship stands in is not."""
+    if ring[:, 0].max() < hull[:, 0].min() or ring[:, 0].min() > hull[:, 0].max() \
+            or ring[:, 1].max() < hull[:, 1].min() or ring[:, 1].min() > hull[:, 1].max():
+        return False
+    from polygon import Path
+    gx, gy = np.meshgrid(np.linspace(ring[:, 0].min(), ring[:, 0].max(), 12),
+                         np.linspace(ring[:, 1].min(), ring[:, 1].max(), 12))
+    pts = np.stack([gx.ravel(), gy.ravel()], 1)
+    pts = pts[Path(ring).contains_points(pts)]
+    return len(pts) > 0 and float(Path(hull).contains_points(pts).mean()) >= ON_HULL_SHARE
 
 
 def _ring_points(r, step=2.0):
@@ -258,6 +305,15 @@ def _cylinder(m, c, u, rx, ry, z0, z1, mat, segs=12, top=True):
         m.quad((a[0], a[1], z0), (b[0], b[1], z0), (b[0], b[1], z1), (a[0], a[1], z1), *_UV0, mat)
     if top:
         m.poly([(p[0], p[1], z1) for p in r], [_UV0[0]] * len(r), mat)
+
+
+def _extrude(m, r, z0, z1, mat):
+    """A mapped part: its own outline (counter-clockwise) upright from z0 to z1, with a flat top."""
+    if z1 <= z0 + 0.1:
+        return
+    for a, b in zip(r, np.roll(r, -1, 0)):
+        m.quad((a[0], a[1], z0), (b[0], b[1], z0), (b[0], b[1], z1), (a[0], a[1], z1), *_UV0, mat)
+    m.poly([(p[0], p[1], z1) for p in r], [_UV0[0]] * len(r), mat)
 
 
 def axis(r):
@@ -378,8 +434,8 @@ def draw(m, spec, gmin, gmax, mat_idx, lite=False):
     beam = 2 * hw
     top = zw + spec.height
     blocks = [B.oriented_box(np.asarray(pr, np.float64)) for pr, ph in parts if ph is None]
-    mapped_funnels = [np.asarray(pr, np.float64) for pr, ph in parts if ph is not None]
-    if not known and any(phl >= PART_BIG_M for _, _, phl, _ in blocks):
+    mapped = [(np.asarray(pr, np.float64), ph) for pr, ph in parts if ph is not None] if not known else []
+    if mapped or (not known and any(phl >= PART_BIG_M for _, _, phl, _ in blocks)):
         zdm = zd(0.5)
         for pc, pu, phl, phw in blocks:         # mapped superstructure: tiers to 0.6 of the height; turrets
             if phl >= PART_BIG_M:
@@ -400,6 +456,14 @@ def draw(m, spec, gmin, gmax, mat_idx, lite=False):
             hy = min(wsh * beam, 0.98 * min(half_b(x0), half_b(x1)))
             if zb_ > za + 0.5 and hy > 0.5:
                 B._box(m, at(xm), ub, (x1 - x0) * hl, hy, za, zb_, paints.get(paint, upper))
+    for pr, (ph, pmh) in mapped:                # each mapped part as it is mapped, from the waterline
+        pc, _, phl, _ = B.oriented_box(pr)
+        if lite and 2 * phl < PART_LITE_M:
+            continue
+        x = float(np.clip((1 - ((pc - c) @ ub) / hl) / 2, 0, 1))
+        _extrude(m, pr, max(zw + pmh, zd(x) - 0.3), zw + pmh + ph, upper)
+    if mapped:                                  # the map is the model: no generic funnels or masts as well
+        return
     isl = prof.get("island")
     if isl:                                     # a carrier's island on its starboard edge
         x0, x1, wsh, ztop = isl
@@ -409,20 +473,12 @@ def draw(m, spec, gmin, gmax, mat_idx, lite=False):
     if lite:
         return
     funnels = []
-    if mapped_funnels and not known:
-        zdm = zd(0.5)
-        for pr in mapped_funnels:
-            pc, pu, phl, phw = B.oriented_box(pr)
-            x = float(np.clip((1 - ((pc - c) @ ub) / hl) / 2, 0, 1))
-            funnels.append((pc, max(phl, 0.9), max(phw, 0.9), zd(x) - 0.3, zdm + 0.85 * (top - zdm),
-                            0.12 * (top - zdm), paints["funnel"]))
-    else:
-        for x, flen, fwid, ztop, paint, btop in prof.get("funnels", []):
-            if prof.get("relative"):
-                flen, fwid, z1, btop = flen * 2 * hl, fwid * 2 * hl, zd(x) + ztop, btop * ztop
-            else:
-                flen, fwid, z1, btop = flen * k, fwid * k, zabs(ztop), btop * k
-            funnels.append((at(x), flen / 2, fwid / 2, zd(x) - 0.3, z1, btop, paints.get(paint, upper)))
+    for x, flen, fwid, ztop, paint, btop in prof.get("funnels", []):
+        if prof.get("relative"):
+            flen, fwid, z1, btop = flen * 2 * hl, fwid * 2 * hl, zd(x) + ztop, btop * ztop
+        else:
+            flen, fwid, z1, btop = flen * k, fwid * k, zabs(ztop), btop * k
+        funnels.append((at(x), flen / 2, fwid / 2, zd(x) - 0.3, z1, btop, paints.get(paint, upper)))
     for pc, rx, ry, z0, z1, btop, mat in funnels:
         if btop > 0 and mat is paints["funnel"] and not navy:      # a liner's: red with a black top
             _cylinder(m, pc, ub, rx, ry, z0, z1 - btop, mat, top=False)
