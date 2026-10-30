@@ -525,10 +525,10 @@ def place(frame, objects, roads, box, elev, chunks=(), left_hand=False, mph=True
             edge = abs((cross[k]*(1.-t)+cross[k+1]*t)@right)*paved_width/2.
             centre = at[:2] + right * side * (edge + 2. + width / 2.)
             # Never put a ground panel in a nearby ramp, frontage road, the other carriageway across a
-            # narrow median or a parallel roadway: step outward a little, else ask for an overhead mount.
+            # narrow median, a parallel roadway or a bridge deck (1.7.2, Baltimore Guilford Ave ramp): step outward a little, else ask for an overhead mount.
             polygons = _outlines(pavements)
             for _ in range(GROUND_SHIFT_STEPS if kind == 'advance' else 12):
-                if _clear(centre, width/2+.5, polygons):
+                if _clear(centre, width/2+.5, polygons) and not _on_deck(centre, chunks, width/2+1.):
                     blocked = False
                     break
                 centre += right*side
@@ -901,9 +901,11 @@ def dimensions(label, kind, state=''):
         groups = [(1.08 if r['kind'] in ('us','interstate') and len(r['number']) >= 3 else .86)
                   + (.28+guide_width(r['qualifier'].title(),.46)
                      if r['qualifier'] in ('NORTH','SOUTH','EAST','WEST') else 0.) for r in routes]
-        # Sized by the legend (MUTCD 2E.14-2E.15: the panel follows its lines, not a fixed blank).
+        # Sized by the legend (MUTCD 2E.14-2E.15: the panel follows its lines, not a fixed blank), a little taller
+        # for the portrait look but never mostly empty (1.7.2: the Guilford Avenue exit, Baltimore).
         width = min(6.0, max(PORTRAIT_MIN_W, max([guide_width(s,.58) for s in names]+groups+[0.])+.65))
-        return width, .6+len(routes)*1.20+len(names)*.85+1.1
+        content = .6+len(routes)*1.20+len(names)*.85+1.1
+        return width, max(content, min(width*1.22, content*1.35))
     lines = label['names'] or ([] if label['routes'] else ['EXIT '+label['ref']])
     longest = max([guide_width(s, .64) for s in lines]+[1.5])
     width = min(8.5, max(LANDSCAPE_MIN_W, longest+.76+.95+(1.45 if label['routes'] else 0.)))
