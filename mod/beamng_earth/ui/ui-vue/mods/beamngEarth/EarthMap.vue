@@ -592,7 +592,7 @@ function screen(lat, lon) {
 const onScreen = p => p.x > -50 && p.y > -50 && p.x < w.value + 50 && p.y < h.value + 50
 
 const placeMarkers = computed(() =>
-  (state.value.places || []).map(p => ({ ...p, ...(() => { const s = screen(p.lat, p.lon); return { sx: s.x, sy: s.y } })() }))
+  toArray(state.value.places).map(p => ({ ...p, ...(() => { const s = screen(p.lat, p.lon); return { sx: s.x, sy: s.y } })() }))
     .filter(p => onScreen({ x: p.sx, y: p.sy })))
 
 // state.others: mpsession.others() ({ pid, name, lat, lon, h }), nil outside a BeamMP session. An older mod's Lua (a
@@ -1649,7 +1649,7 @@ function fmtMiles(m) {
 // ---- search --------------------------------------------------------------------------------
 function allPlaces() {
   const s = state.value
-  return [...(s.places || []), ...(s.recent || []).map(r => ({ ...r, name: r.name || r.text }))]
+  return [...toArray(s.places), ...toArray(s.recent).map(r => ({ ...r, name: r.name || r.text }))]
 }
 
 function goTo(lat, lon, name) {
