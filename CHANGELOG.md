@@ -2,6 +2,13 @@
 
 What changed in each release of BeamNG.Earth, newest first.
 
+## Unreleased
+
+- Moored ships (museum ships, OSM building=ship / historic=ship, or a ship's name, or a ship-shaped outline on mapped
+  water) are drawn as hulls lofted from their own footprint, with a class profile (Iowa class, Queen Mary, Midway,
+  Essex class; else a generic warship or liner), not as building prisms. A quay alongside one (its LiDAR height is
+  the ship's flank) is a low deck. New server/ships.py; tile build time unchanged.
+
 ## 1.7.2 beta (2026-10-29)
 
 > **Join the TGForever Discord, [discord.gg/tgf](https://discord.gg/tgf), to chat, get help, report bugs or help
